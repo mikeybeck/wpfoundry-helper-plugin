@@ -1,149 +1,91 @@
 <?php
 /*
-Plugin Name: WP Foundry Agent (Final 6.3+)
-Description: Secure REST API for WP Foundry using proper Application Password authentication with debug logs
-Version: 2.1
-Author: You
+Plugin Name: WP Foundry Helper
+Description: Provides REST + SSE streaming for WP-CLI commands.
+Version: 2.2
+Author: Mikey
 */
 
-if (!defined('ABSPATH')) exit;
-
-/**
- * REST API endpoint
- */
 add_action('rest_api_init', function () {
-
-    register_rest_route('foundry/v1', '/run', [
+    // POST endpoint to queue a command
+    register_rest_route('wpfoundry/v1', '/command', [
         'methods' => 'POST',
-        'callback' => function($request) {
-
-            $log = [];
-
-            // Detect Basic Auth headers
-            $username = $_SERVER['PHP_AUTH_USER'] ?? null;
-            $password = $_SERVER['PHP_AUTH_PW'] ?? null;
-
-            // Fallback for servers stripping Authorization headers
-            if (!$username || !$password) {
-                if (!empty($_SERVER['REDIRECT_HTTP_AUTHORIZATION']) &&
-                    strpos($_SERVER['REDIRECT_HTTP_AUTHORIZATION'], 'Basic ') === 0) {
-                    $basic = base64_decode(substr($_SERVER['REDIRECT_HTTP_AUTHORIZATION'], 6));
-                    list($username, $password) = explode(':', $basic, 2);
-                }
-            }
-
-            $log[] = "PHP_AUTH_USER=" . ($username ?? '(empty)');
-            $log[] = "PHP_AUTH_PW=" . ($password ? '******' : '(empty)');
-
-            if (!$username || !$password) {
-                return new WP_REST_Response([
-                    'success' => false,
-                    'error' => 'Missing authentication headers',
-                    'log' => $log
-                ], 401);
-            }
-
-            // Lookup user by login/email
-            $user = get_user_by('login', $username);
-            if (!$user) {
-                $log[] = "User not found by login, trying email";
-                $user = get_user_by('email', $username);
-            }
-
-            if (!$user) {
-                $log[] = "User not found at all";
-                return new WP_REST_Response([
-                    'success' => false,
-                    'error' => 'Invalid username',
-                    'log' => $log
-                ], 403);
-            }
-
-            $log[] = "User found: ID=" . $user->ID;
-
-            // Authenticate using WordPress Application Password
-            if (!function_exists('wp_authenticate_application_password')) {
-                return new WP_REST_Response([
-                    'success' => false,
-                    'error' => 'wp_authenticate_application_password() not available',
-                    'log' => $log
-                ], 500);
-            }
-
-            // ⚠ Pass $request as 3rd argument to satisfy WP 6.3+ requirement
-            $auth_result = wp_authenticate_application_password($user, $password, $request);
-            if (is_wp_error($auth_result)) {
-                $log[] = "Authentication failed: " . $auth_result->get_error_message();
-                return new WP_REST_Response([
-                    'success' => false,
-                    'error' => 'Invalid credentials',
-                    'log' => $log
-                ], 403);
-            }
-
-            $log[] = "Authentication successful";
-
-            // Capability check
-            if (!user_can($auth_result, 'manage_options')) {
-                $log[] = "User lacks manage_options capability";
-                return new WP_REST_Response([
-                    'success' => false,
-                    'error' => 'Insufficient permissions',
-                    'log' => $log
-                ], 403);
-            }
-
-            $log[] = "User has admin permissions";
-
-            // Get command and args
-            $params = $request->get_json_params();
-            $command = $params['command'] ?? '';
-            $args = $params['args'] ?? [];
-
-            $log[] = "Command requested: $command";
-            $log[] = "Args: " . json_encode($args);
-
-            if (empty($command)) {
-                return new WP_REST_Response([
-                    'success' => false,
-                    'error' => 'No command specified',
-                    'log' => $log
-                ], 400);
-            }
-
-            // Optional whitelist
-            $allowed = ['plugin', 'theme', 'core', 'user', 'site'];
-            if (!in_array($command, $allowed)) {
-                $log[] = "Command not allowed";
-                return new WP_REST_Response([
-                    'success' => false,
-                    'error' => 'Command not allowed',
-                    'log' => $log
-                ], 403);
-            }
-
-            // Execute WP-CLI
-            $escapedArgs = array_map('escapeshellarg', $args);
-            $cmdLine = 'wp ' . escapeshellarg($command) . ' ' . implode(' ', $escapedArgs);
-            $log[] = "Executing shell command: $cmdLine";
-
-            $output = [];
-            $exitCode = 0;
-            exec($cmdLine . ' 2>&1', $output, $exitCode);
-
-            $log[] = "Command exit code: $exitCode";
-            $log[] = "Command output: " . implode("\n", $output);
-
-            return [
-                'success' => true,
-                'command' => $command,
-                'args' => $args,
-                'output' => $output,
-                'exit_code' => $exitCode,
-                'log' => $log
-            ];
+        'callback' => 'wpf_run_command',
+        'permission_callback' => function () {
+            return current_user_can('administrator');
         },
-        'permission_callback' => '__return_true'
     ]);
 
+    // GET endpoint for SSE stream
+    register_rest_route('wpfoundry/v1', '/stream', [
+        'methods' => 'GET',
+        'callback' => 'wpf_sse_stream',
+        'permission_callback' => function () {
+            return current_user_can('administrator');
+        },
+    ]);
 });
+
+// Temporary store for commands (could be replaced with DB/queue)
+function wpf_command_queue() {
+    static $queue = [];
+    return $queue;
+}
+
+// POST /command - queue a command
+function wpf_run_command($request) {
+    $params = $request->get_json_params();
+    $command = sanitize_text_field($params['command'] ?? '');
+    if (empty($command)) {
+        return new WP_Error('empty_command', 'No command provided', ['status' => 400]);
+    }
+
+    // Add to temporary queue
+    $queue = &wpf_command_queue();
+    $queue[] = $command;
+
+    return ['success' => true, 'message' => 'Command queued', 'command' => $command];
+}
+
+// GET /stream - SSE endpoint
+function wpf_sse_stream() {
+    if (!is_user_logged_in()) {
+        return new WP_Error('forbidden', 'You must be logged in', ['status' => 403]);
+    }
+
+    header('Content-Type: text/event-stream');
+    header('Cache-Control: no-cache');
+    header('Connection: keep-alive');
+    @ob_end_clean();
+    @flush();
+
+    $queue = &wpf_command_queue();
+
+    while (true) {
+        if (!empty($queue)) {
+            $cmd = array_shift($queue);
+
+            // Execute WP-CLI command
+            $output = [];
+            $return_var = 0;
+            exec("wp {$cmd} 2>&1", $output, $return_var);
+
+            $data = json_encode([
+                'command' => $cmd,
+                'exit_code' => $return_var,
+                'output' => implode("\n", $output)
+            ]);
+
+            // Send SSE event
+            echo "event: command_output\n";
+            echo "data: {$data}\n\n";
+            @ob_flush();
+            @flush();
+        }
+
+        // Avoid busy loop
+        sleep(1);
+    }
+
+    exit;
+}
