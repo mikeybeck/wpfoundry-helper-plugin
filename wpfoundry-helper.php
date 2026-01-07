@@ -314,11 +314,14 @@ class WPFCommandRunner {
             2 => ['pipe', 'w'], // stderr
         ];
 
+        // SECURITY: Sanitize command for shell execution
+        $safe_command = escapeshellcmd("wp $command");
+
         // Set WP-CLI cache dir to a writable location
         $env = $_ENV;
         $env['WP_CLI_CACHE_DIR'] = sys_get_temp_dir() . '/wp-cli-cache';
 
-        $process = proc_open("wp $command 2>&1", $descriptorspec, $pipes, ABSPATH, $env);
+        $process = proc_open($safe_command . " 2>&1", $descriptorspec, $pipes, ABSPATH, $env);
         if (!is_resource($process)) {
             $this->emit_event('command_error', [
                 'error' => 'failed_to_start',
@@ -424,11 +427,91 @@ class WPFCommandRunner {
     }
 }
 
-function wpf_run_command_sse($request) {
-    $params = $request->get_json_params();
-    $command = sanitize_text_field($params['command'] ?? '');
+/**
+ * Validate and sanitize WP-CLI command input
+ */
+function wpf_validate_command($command) {
+    // SECURITY: Check for command injection attempts
+    if (preg_match('/[;&|`$()<>]/', $command)) {
+        return false;
+    }
 
-    if (empty($command)) {
+    // SECURITY: Limit command length
+    if (strlen($command) > 1000) {
+        return false;
+    }
+
+    // SECURITY: Only allow specific wp commands
+    $allowed_commands = [
+        'wp plugin',
+        'wp theme',
+        'wp core',
+        'wp user',
+        'wp option',
+        'wp post',
+        'wp db',
+        'wp cache',
+        'wpfoundry',
+        'wp config',
+        'wp site',
+        'wp network',
+        'wp menu',
+        'wp widget',
+        'wp sidebar',
+    ];
+
+    $command_start = strtolower(substr(trim($command), 0, 20));
+    foreach ($allowed_commands as $allowed) {
+        if (strpos($command_start, $allowed) === 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// Simple rate limiter to prevent abuse
+function wpf_check_rate_limit() {
+    $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+    $key = 'wpf_rate_limit_' . md5($ip);
+    $now = time();
+
+    // Get current rate limit data
+    $data = get_transient($key);
+    if (!$data) {
+        $data = ['count' => 0, 'reset' => $now + 60]; // 60 second window
+    }
+
+    // Reset if window expired
+    if ($now > $data['reset']) {
+        $data = ['count' => 0, 'reset' => $now + 60];
+    }
+
+    // Check rate limit (max 10 requests per minute)
+    if ($data['count'] >= 10) {
+        return false;
+    }
+
+    // Increment counter
+    $data['count']++;
+    set_transient($key, $data, 60);
+
+    return true;
+}
+
+function wpf_run_command_sse($request) {
+    // SECURITY: Rate limiting
+    if (!wpf_check_rate_limit()) {
+        header('Content-Type: application/json');
+        echo json_encode(['error' => 'Rate limit exceeded']);
+        return;
+    }
+
+    $params = $request->get_json_params();
+    $command = $params['command'] ?? '';
+
+    // SECURITY: Validate command input
+    if (empty($command) || !is_string($command) || !wpf_validate_command($command)) {
         header('Content-Type: application/json');
         return new WP_Error('empty_command', 'No command provided', ['status' => 400]);
     }
