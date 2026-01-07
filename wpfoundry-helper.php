@@ -29,7 +29,274 @@ class WPFCommandRunner {
         @ob_flush(); @flush();
     }
 
+    private function execute_wpfoundry_command($command) {
+        // Parse the wpfoundry command
+        $parts = explode(' ', trim($command));
+        array_shift($parts); // Remove 'wpfoundry'
+
+        if (empty($parts)) {
+            $this->emit_event('command_error', [
+                'error' => 'invalid_command',
+                'message' => 'No wpfoundry subcommand specified',
+                'command' => $command
+            ]);
+            return;
+        }
+
+        $subcommand = $parts[0];
+        $args = array_slice($parts, 1);
+
+        switch ($subcommand) {
+            case 'version':
+                $this->wpfoundry_version();
+                break;
+            case 'list-files':
+                $this->wpfoundry_list_files($args);
+                break;
+            default:
+                $this->emit_event('command_error', [
+                    'error' => 'unknown_subcommand',
+                    'message' => "Unknown wpfoundry subcommand: $subcommand",
+                    'command' => $command
+                ]);
+                return;
+        }
+    }
+
+    private function wpfoundry_version() {
+        $this->emit_event('command_start', [
+            'command' => 'wpfoundry version',
+            'wp_command' => 'wpfoundry',
+            'start_time' => microtime(true)
+        ]);
+
+        $version = '1.0.0'; // Built-in version
+
+        $this->emit_event('command_data', [
+            'data' => [['status' => 'success', 'version' => $version]],
+            'line_number' => 1,
+            'raw_line' => json_encode(['status' => 'success', 'version' => $version])
+        ]);
+
+        $this->emit_event('command_complete', [
+            'exit_code' => 0,
+            'status' => 'success',
+            'total_lines' => 1,
+            'end_time' => microtime(true)
+        ]);
+    }
+
+    private function wpfoundry_list_files($args) {
+        $this->emit_event('command_start', [
+            'command' => 'wpfoundry list-files ' . implode(' ', $args),
+            'wp_command' => 'wpfoundry',
+            'start_time' => microtime(true)
+        ]);
+
+        // Parse arguments
+        $options = $this->parse_list_files_args($args);
+
+        try {
+            $files = $this->scan_files($options);
+            $result = [
+                'status' => 'success',
+                'count' => count($files),
+                'files' => $files
+            ];
+
+            $this->emit_event('command_data', [
+                'data' => [$result],
+                'line_number' => 1,
+                'raw_line' => json_encode($result)
+            ]);
+
+            $this->emit_event('command_complete', [
+                'exit_code' => 0,
+                'status' => 'success',
+                'total_lines' => 1,
+                'end_time' => microtime(true)
+            ]);
+
+        } catch (Exception $e) {
+            $this->emit_event('command_error', [
+                'error' => 'list_files_failed',
+                'message' => $e->getMessage(),
+                'exit_code' => 1,
+                'status' => 'error'
+            ]);
+        }
+    }
+
+    private function parse_list_files_args($args) {
+        $options = [
+            'type' => 'all',
+            'path' => '',
+            'recursive' => true,
+            'max_depth' => 3,
+            'include' => [],
+            'exclude' => []
+        ];
+
+        for ($i = 0; $i < count($args); $i++) {
+            $arg = $args[$i];
+            if (strpos($arg, '--') === 0) {
+                $option = substr($arg, 2);
+                if (isset($args[$i + 1]) && strpos($args[$i + 1], '--') !== 0) {
+                    $value = $args[$i + 1];
+                    $i++; // Skip next arg
+
+                    switch ($option) {
+                        case 'type':
+                            $options['type'] = $value;
+                            break;
+                        case 'path':
+                            $options['path'] = $value;
+                            break;
+                        case 'max-depth':
+                            $options['max_depth'] = intval($value);
+                            break;
+                        case 'include':
+                            $options['include'] = explode(',', $value);
+                            break;
+                        case 'exclude':
+                            $options['exclude'] = explode(',', $value);
+                            break;
+                    }
+                } elseif ($option === 'recursive') {
+                    $options['recursive'] = true;
+                } elseif ($option === 'no-recursive') {
+                    $options['recursive'] = false;
+                }
+            }
+        }
+
+        return $options;
+    }
+
+    private function scan_files($options) {
+        $base_paths = [
+            'core' => ABSPATH,
+            'plugins' => WP_PLUGIN_DIR,
+            'themes' => WP_CONTENT_DIR . '/themes',
+            'uploads' => WP_CONTENT_DIR . '/uploads',
+            'content' => WP_CONTENT_DIR
+        ];
+
+        if (!empty($options['path'])) {
+            $scan_path = ABSPATH . ltrim($options['path'], '/');
+        } else {
+            $scan_path = isset($base_paths[$options['type']]) ? $base_paths[$options['type']] : ABSPATH;
+        }
+
+        if (!is_dir($scan_path)) {
+            throw new Exception("Directory does not exist: $scan_path");
+        }
+
+        return $this->scan_directory($scan_path, $scan_path, $options, 0);
+    }
+
+    private function scan_directory($dir, $base_path, $options, $current_depth) {
+        $files = [];
+
+        if (!$options['recursive'] && $current_depth > 0) {
+            return $files;
+        }
+
+        if ($current_depth > $options['max_depth']) {
+            return $files;
+        }
+
+        $items = scandir($dir);
+        if ($items === false) {
+            return $files;
+        }
+
+        foreach ($items as $item) {
+            if ($item === '.' || $item === '..') {
+                continue;
+            }
+
+            $full_path = $dir . '/' . $item;
+            $relative_path = substr($full_path, strlen($base_path));
+
+            // Check exclude patterns
+            if ($this->matches_patterns($relative_path, $options['exclude'])) {
+                continue;
+            }
+
+            // Check include patterns (if specified)
+            if (!empty($options['include']) && !$this->matches_patterns($relative_path, $options['include'])) {
+                continue;
+            }
+
+            if (is_dir($full_path)) {
+                $files = array_merge($files, $this->scan_directory($full_path, $base_path, $options, $current_depth + 1));
+            } else {
+                $files[] = [
+                    'path' => ltrim($relative_path, '/'),
+                    'full_path' => $full_path,
+                    'size' => filesize($full_path),
+                    'modified' => filemtime($full_path),
+                    'type' => $this->get_file_type($full_path),
+                    'readable' => is_readable($full_path),
+                    'writable' => is_writable($full_path)
+                ];
+            }
+        }
+
+        return $files;
+    }
+
+    private function matches_patterns($path, $patterns) {
+        if (empty($patterns)) {
+            return false;
+        }
+
+        foreach ($patterns as $pattern) {
+            $pattern = trim($pattern);
+            if (empty($pattern)) {
+                continue;
+            }
+
+            // Simple wildcard matching
+            $regex = str_replace(['*', '?'], ['.*', '.'], preg_quote($pattern, '/'));
+            if (preg_match('/^' . $regex . '$/i', basename($path))) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function get_file_type($file_path) {
+        $extension = strtolower(pathinfo($file_path, PATHINFO_EXTENSION));
+
+        $types = [
+            'php' => 'php',
+            'js' => 'javascript',
+            'css' => 'stylesheet',
+            'scss' => 'scss',
+            'sass' => 'sass',
+            'html' => 'html',
+            'xml' => 'xml',
+            'json' => 'json',
+            'jpg' => 'image',
+            'jpeg' => 'image',
+            'png' => 'image',
+            'gif' => 'image',
+            'svg' => 'image',
+            'pdf' => 'document',
+        ];
+
+        return $types[$extension] ?? 'unknown';
+    }
+
     public function execute_command($command) {
+        // Handle wpfoundry commands directly (bypass WP-CLI package issues)
+        if (strpos($command, 'wpfoundry ') === 0) {
+            return $this->execute_wpfoundry_command($command);
+        }
+
         // Parse command to extract structured info
         $command_parts = explode(' ', trim($command));
         $wp_command = $command_parts[0] ?? $command;
@@ -47,7 +314,11 @@ class WPFCommandRunner {
             2 => ['pipe', 'w'], // stderr
         ];
 
-        $process = proc_open("wp $command 2>&1", $descriptorspec, $pipes, ABSPATH);
+        // Set WP-CLI cache dir to a writable location
+        $env = $_ENV;
+        $env['WP_CLI_CACHE_DIR'] = sys_get_temp_dir() . '/wp-cli-cache';
+
+        $process = proc_open("wp $command 2>&1", $descriptorspec, $pipes, ABSPATH, $env);
         if (!is_resource($process)) {
             $this->emit_event('command_error', [
                 'error' => 'failed_to_start',
