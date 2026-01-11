@@ -86,6 +86,29 @@ class WPFCommandRunner {
         ]);
     }
 
+    private function execute_core_version_command() {
+        $this->emit_event('command_start', [
+            'command' => 'core version',
+            'wp_command' => 'wp core',
+            'start_time' => microtime(true)
+        ]);
+
+        $version = get_bloginfo('version');
+
+        $this->emit_event('command_data', [
+            'data' => ['version' => $version],
+            'line_number' => 1,
+            'raw_line' => json_encode(['version' => $version])
+        ]);
+
+        $this->emit_event('command_complete', [
+            'exit_code' => 0,
+            'status' => 'success',
+            'total_lines' => 1,
+            'end_time' => microtime(true)
+        ]);
+    }
+
     private function wpfoundry_list_files($args) {
         $this->emit_event('command_start', [
             'command' => 'wpfoundry list-files ' . implode(' ', $args),
@@ -292,6 +315,11 @@ class WPFCommandRunner {
     }
 
     public function execute_command($command) {
+        // Handle special commands that need JSON output
+        if ($command === 'wpfoundry core-version') {
+            return $this->execute_core_version_command();
+        }
+
         // Handle wpfoundry commands directly (bypass WP-CLI package issues)
         if (strpos($command, 'wpfoundry ') === 0) {
             return $this->execute_wpfoundry_command($command);
