@@ -341,7 +341,9 @@ class WPFCommandRunner {
         ];
 
         // SECURITY: Sanitize command for shell execution
-        $safe_command = escapeshellcmd("wp $command");
+        // Don't add 'wp' prefix if command already starts with 'wp'
+        $command_to_run = (strpos($command, 'wp ') === 0) ? $command : "wp $command";
+        $safe_command = escapeshellcmd($command_to_run);
 
         // Set WP-CLI cache dir to a writable location
         $env = $_ENV;
