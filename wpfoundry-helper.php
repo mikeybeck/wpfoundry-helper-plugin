@@ -53,6 +53,15 @@ class WPFCommandRunner {
             case 'core-version':
                 $this->execute_core_version_command();
                 break;
+            case 'helper-version':
+                $this->wpfoundry_helper_version();
+                break;
+            case 'helper-latest':
+                $this->wpfoundry_helper_latest($args);
+                break;
+            case 'helper-update':
+                $this->wpfoundry_helper_update($args);
+                break;
             case 'list-files':
                 $this->wpfoundry_list_files($args);
                 break;
@@ -110,6 +119,274 @@ class WPFCommandRunner {
             'total_lines' => 1,
             'end_time' => microtime(true)
         ]);
+    }
+
+    private function wpfoundry_get_this_plugin_version() {
+        if (!function_exists('get_plugin_data')) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+        $data = get_plugin_data(__FILE__, false, false);
+        return isset($data['Version']) ? $data['Version'] : 'unknown';
+    }
+
+    private function wpfoundry_get_this_plugin_slug_dir() {
+        // plugin_basename(__FILE__) -> "wpfoundry-helper/wpfoundry-helper.php"
+        $base = plugin_basename(__FILE__);
+        $dir = dirname($base);
+        return $dir === '.' ? '' : $dir;
+    }
+
+    private function wpfoundry_download_and_extract_zip($zip_url) {
+        if (!function_exists('download_url') || !function_exists('unzip_file')) {
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+        }
+
+        $tmp = download_url($zip_url, 120);
+        if (is_wp_error($tmp)) {
+            throw new Exception('Download failed: ' . $tmp->get_error_message());
+        }
+
+        $extract_base = trailingslashit(sys_get_temp_dir()) . 'wpfoundry-helper-update-' . uniqid('', true);
+        if (!wp_mkdir_p($extract_base)) {
+            @unlink($tmp);
+            throw new Exception('Failed to create temp dir for extraction');
+        }
+
+        $result = unzip_file($tmp, $extract_base);
+        @unlink($tmp);
+
+        if (is_wp_error($result)) {
+            throw new Exception('Unzip failed: ' . $result->get_error_message());
+        }
+
+        return $extract_base;
+    }
+
+    private function wpfoundry_find_file_recursive($base_dir, $target_filename, $max_depth = 6, $depth = 0) {
+        if ($depth > $max_depth) {
+            return null;
+        }
+
+        $items = @scandir($base_dir);
+        if ($items === false) {
+            return null;
+        }
+
+        foreach ($items as $item) {
+            if ($item === '.' || $item === '..') {
+                continue;
+            }
+
+            $full = $base_dir . DIRECTORY_SEPARATOR . $item;
+            if (is_dir($full)) {
+                $found = $this->wpfoundry_find_file_recursive($full, $target_filename, $max_depth, $depth + 1);
+                if ($found) {
+                    return $found;
+                }
+            } elseif ($item === $target_filename) {
+                return $full;
+            }
+        }
+
+        return null;
+    }
+
+    private function wpfoundry_cleanup_dir_best_effort($dir) {
+        if (!$dir) {
+            return;
+        }
+        if (!function_exists('WP_Filesystem')) {
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+        }
+        WP_Filesystem();
+        global $wp_filesystem;
+        if ($wp_filesystem) {
+            $wp_filesystem->delete($dir, true);
+        }
+    }
+
+    private function wpfoundry_helper_version() {
+        $this->emit_event('command_start', [
+            'command' => 'wpfoundry helper-version',
+            'wp_command' => 'wpfoundry',
+            'start_time' => microtime(true)
+        ]);
+
+        $payload = [
+            'status' => 'success',
+            'version' => $this->wpfoundry_get_this_plugin_version(),
+            'slug' => $this->wpfoundry_get_this_plugin_slug_dir(),
+        ];
+
+        $this->emit_event('command_data', [
+            'data' => $payload,
+            'line_number' => 1,
+            'raw_line' => json_encode($payload)
+        ]);
+
+        $this->emit_event('command_complete', [
+            'exit_code' => 0,
+            'status' => 'success',
+            'total_lines' => 1,
+            'end_time' => microtime(true)
+        ]);
+    }
+
+    private function wpfoundry_helper_latest($args) {
+        $this->emit_event('command_start', [
+            'command' => 'wpfoundry helper-latest ' . implode(' ', $args),
+            'wp_command' => 'wpfoundry',
+            'start_time' => microtime(true)
+        ]);
+
+        $zip_url = isset($args[0]) ? $args[0] : '';
+        if (!$zip_url) {
+            $this->emit_event('command_error', [
+                'error' => 'missing_zip_url',
+                'message' => 'Missing zip URL argument',
+                'exit_code' => 1,
+                'status' => 'error'
+            ]);
+            return;
+        }
+
+        try {
+            $extract_base = $this->wpfoundry_download_and_extract_zip($zip_url);
+            $main_file = $this->wpfoundry_find_file_recursive($extract_base, 'wpfoundry-helper.php', 6);
+            if (!$main_file) {
+                $this->wpfoundry_cleanup_dir_best_effort($extract_base);
+                throw new Exception('Could not locate wpfoundry-helper.php in extracted archive');
+            }
+
+            if (!function_exists('get_plugin_data')) {
+                require_once ABSPATH . 'wp-admin/includes/plugin.php';
+            }
+            $data = get_plugin_data($main_file, false, false);
+            $latest_version = isset($data['Version']) ? $data['Version'] : 'unknown';
+
+            $this->wpfoundry_cleanup_dir_best_effort($extract_base);
+
+            $payload = [
+                'status' => 'success',
+                'version' => $latest_version,
+            ];
+
+            $this->emit_event('command_data', [
+                'data' => $payload,
+                'line_number' => 1,
+                'raw_line' => json_encode($payload)
+            ]);
+
+            $this->emit_event('command_complete', [
+                'exit_code' => 0,
+                'status' => 'success',
+                'total_lines' => 1,
+                'end_time' => microtime(true)
+            ]);
+        } catch (Exception $e) {
+            $this->emit_event('command_error', [
+                'error' => 'helper_latest_failed',
+                'message' => $e->getMessage(),
+                'exit_code' => 1,
+                'status' => 'error'
+            ]);
+        }
+    }
+
+    private function wpfoundry_helper_update($args) {
+        $this->emit_event('command_start', [
+            'command' => 'wpfoundry helper-update ' . implode(' ', $args),
+            'wp_command' => 'wpfoundry',
+            'start_time' => microtime(true)
+        ]);
+
+        $zip_url = isset($args[0]) ? $args[0] : '';
+        if (!$zip_url) {
+            $this->emit_event('command_error', [
+                'error' => 'missing_zip_url',
+                'message' => 'Missing zip URL argument',
+                'exit_code' => 1,
+                'status' => 'error'
+            ]);
+            return;
+        }
+
+        try {
+            $previous_version = $this->wpfoundry_get_this_plugin_version();
+            $slug_dir = $this->wpfoundry_get_this_plugin_slug_dir();
+            if (!$slug_dir) {
+                throw new Exception('Could not determine plugin directory slug');
+            }
+
+            $extract_base = $this->wpfoundry_download_and_extract_zip($zip_url);
+            $main_file = $this->wpfoundry_find_file_recursive($extract_base, 'wpfoundry-helper.php', 6);
+            if (!$main_file) {
+                $this->wpfoundry_cleanup_dir_best_effort($extract_base);
+                throw new Exception('Could not locate wpfoundry-helper.php in extracted archive');
+            }
+
+            if (!function_exists('get_plugin_data')) {
+                require_once ABSPATH . 'wp-admin/includes/plugin.php';
+            }
+            $data = get_plugin_data($main_file, false, false);
+            $latest_version = isset($data['Version']) ? $data['Version'] : 'unknown';
+
+            $source_dir = dirname($main_file);
+            $dest_dir = trailingslashit(WP_PLUGIN_DIR) . $slug_dir;
+
+            if (!function_exists('WP_Filesystem') || !function_exists('copy_dir')) {
+                require_once ABSPATH . 'wp-admin/includes/file.php';
+            }
+
+            WP_Filesystem();
+            global $wp_filesystem;
+            if (!$wp_filesystem) {
+                throw new Exception('WP_Filesystem could not be initialized');
+            }
+
+            // Replace plugin directory
+            $wp_filesystem->delete($dest_dir, true);
+            if (!wp_mkdir_p($dest_dir)) {
+                throw new Exception('Failed to recreate plugin directory');
+            }
+
+            $copy_result = copy_dir($source_dir, $dest_dir);
+            if (is_wp_error($copy_result)) {
+                throw new Exception('Copy failed: ' . $copy_result->get_error_message());
+            }
+
+            $this->wpfoundry_cleanup_dir_best_effort($extract_base);
+
+            $new_version = $this->wpfoundry_get_this_plugin_version();
+
+            $payload = [
+                'status' => 'success',
+                'previous_version' => $previous_version,
+                'latest_version' => $latest_version,
+                'version' => $new_version,
+                'updated' => true,
+            ];
+
+            $this->emit_event('command_data', [
+                'data' => $payload,
+                'line_number' => 1,
+                'raw_line' => json_encode($payload)
+            ]);
+
+            $this->emit_event('command_complete', [
+                'exit_code' => 0,
+                'status' => 'success',
+                'total_lines' => 1,
+                'end_time' => microtime(true)
+            ]);
+        } catch (Exception $e) {
+            $this->emit_event('command_error', [
+                'error' => 'helper_update_failed',
+                'message' => $e->getMessage(),
+                'exit_code' => 1,
+                'status' => 'error'
+            ]);
+        }
     }
 
     private function wpfoundry_list_files($args) {
