@@ -50,6 +50,9 @@ class WPFCommandRunner {
             case 'version':
                 $this->wpfoundry_version();
                 break;
+            case 'core-version':
+                $this->execute_core_version_command();
+                break;
             case 'list-files':
                 $this->wpfoundry_list_files($args);
                 break;
@@ -315,11 +318,6 @@ class WPFCommandRunner {
     }
 
     public function execute_command($command) {
-        // Handle special commands that need JSON output
-        if ($command === 'wpfoundry core-version') {
-            return $this->execute_core_version_command();
-        }
-
         // Handle wpfoundry commands directly (bypass WP-CLI package issues)
         if (strpos($command, 'wpfoundry ') === 0) {
             return $this->execute_wpfoundry_command($command);
