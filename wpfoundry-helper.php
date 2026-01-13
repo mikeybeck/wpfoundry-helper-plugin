@@ -846,13 +846,25 @@ class WPFCommandRunner {
 
         $token = bin2hex(random_bytes(16));
         $expires_in = 300;
+        $expires_at = time() + $expires_in;
         $filename = sprintf('%s-%s-backup.zip', $type, $slug);
 
+        // Store token info. Prefer DB-backed transient, but also persist to a temp file
+        // because some sites use non-persistent object caches for transients.
         set_transient('wpf_dl_' . $token, [
             'path' => $zip_path,
             'filename' => $filename,
             'created_at' => time(),
+            'expires_at' => $expires_at,
         ], $expires_in);
+
+        $token_file = trailingslashit(sys_get_temp_dir()) . 'wpfoundry-dl-' . $token . '.json';
+        @file_put_contents($token_file, json_encode([
+            'path' => $zip_path,
+            'filename' => $filename,
+            'created_at' => time(),
+            'expires_at' => $expires_at,
+        ]));
 
         return [
             'token' => $token,
@@ -1084,6 +1096,26 @@ function wpf_download_file($request) {
 
     $data = get_transient('wpf_dl_' . $token);
     if (!$data || !is_array($data)) {
+        // Fallback to temp file storage
+        $token_file = trailingslashit(sys_get_temp_dir()) . 'wpfoundry-dl-' . $token . '.json';
+        if (file_exists($token_file)) {
+            $raw = @file_get_contents($token_file);
+            $decoded = $raw ? json_decode($raw, true) : null;
+            if (is_array($decoded)) {
+                $data = $decoded;
+            }
+        }
+    }
+
+    if (!$data || !is_array($data)) {
+        return new WP_Error('token_not_found', 'Token not found or expired', ['status' => 404]);
+    }
+
+    // Expiry enforcement (works for both transient + file fallback)
+    if (isset($data['expires_at']) && is_numeric($data['expires_at']) && time() > intval($data['expires_at'])) {
+        delete_transient('wpf_dl_' . $token);
+        $token_file = trailingslashit(sys_get_temp_dir()) . 'wpfoundry-dl-' . $token . '.json';
+        @unlink($token_file);
         return new WP_Error('token_not_found', 'Token not found or expired', ['status' => 404]);
     }
 
@@ -1092,6 +1124,8 @@ function wpf_download_file($request) {
 
     if (!$path || !is_string($path) || !file_exists($path)) {
         delete_transient('wpf_dl_' . $token);
+        $token_file = trailingslashit(sys_get_temp_dir()) . 'wpfoundry-dl-' . $token . '.json';
+        @unlink($token_file);
         return new WP_Error('file_not_found', 'Backup file not found', ['status' => 404]);
     }
 
@@ -1115,6 +1149,8 @@ function wpf_download_file($request) {
 
     @unlink($path);
     delete_transient('wpf_dl_' . $token);
+    $token_file = trailingslashit(sys_get_temp_dir()) . 'wpfoundry-dl-' . $token . '.json';
+    @unlink($token_file);
 
     exit;
 }
