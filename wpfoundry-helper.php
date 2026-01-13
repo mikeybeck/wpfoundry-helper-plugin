@@ -137,8 +137,12 @@ class WPFCommandRunner {
     }
 
     private function wpfoundry_download_and_extract_zip($zip_url) {
-        if (!function_exists('download_url') || !function_exists('unzip_file')) {
+        if (!function_exists('download_url')) {
             require_once ABSPATH . 'wp-admin/includes/file.php';
+        }
+
+        if (!class_exists('ZipArchive')) {
+            throw new Exception('ZipArchive is not available on this server');
         }
 
         $tmp = download_url($zip_url, 120);
@@ -152,11 +156,19 @@ class WPFCommandRunner {
             throw new Exception('Failed to create temp dir for extraction');
         }
 
-        $result = unzip_file($tmp, $extract_base);
+        $zip = new ZipArchive();
+        $opened = $zip->open($tmp);
+        if ($opened !== true) {
+            @unlink($tmp);
+            throw new Exception('Unzip failed: unable to open zip (code ' . $opened . ')');
+        }
+
+        $ok = $zip->extractTo($extract_base);
+        $zip->close();
         @unlink($tmp);
 
-        if (is_wp_error($result)) {
-            throw new Exception('Unzip failed: ' . $result->get_error_message());
+        if (!$ok) {
+            throw new Exception('Unzip failed: extractTo() returned false');
         }
 
         return $extract_base;
@@ -195,13 +207,55 @@ class WPFCommandRunner {
         if (!$dir) {
             return;
         }
-        if (!function_exists('WP_Filesystem')) {
-            require_once ABSPATH . 'wp-admin/includes/file.php';
+        $this->wpfoundry_delete_dir_recursive($dir);
+    }
+
+    private function wpfoundry_delete_dir_recursive($dir) {
+        if (!file_exists($dir)) {
+            return;
         }
-        WP_Filesystem();
-        global $wp_filesystem;
-        if ($wp_filesystem) {
-            $wp_filesystem->delete($dir, true);
+        if (is_file($dir) || is_link($dir)) {
+            @unlink($dir);
+            return;
+        }
+        $items = @scandir($dir);
+        if ($items === false) {
+            return;
+        }
+        foreach ($items as $item) {
+            if ($item === '.' || $item === '..') {
+                continue;
+            }
+            $path = $dir . DIRECTORY_SEPARATOR . $item;
+            $this->wpfoundry_delete_dir_recursive($path);
+        }
+        @rmdir($dir);
+    }
+
+    private function wpfoundry_copy_dir_recursive($src, $dst) {
+        if (!is_dir($src)) {
+            throw new Exception('Source directory does not exist: ' . $src);
+        }
+        if (!wp_mkdir_p($dst)) {
+            throw new Exception('Failed to create destination directory: ' . $dst);
+        }
+        $items = @scandir($src);
+        if ($items === false) {
+            throw new Exception('Failed to read source directory: ' . $src);
+        }
+        foreach ($items as $item) {
+            if ($item === '.' || $item === '..') {
+                continue;
+            }
+            $srcPath = $src . DIRECTORY_SEPARATOR . $item;
+            $dstPath = $dst . DIRECTORY_SEPARATOR . $item;
+            if (is_dir($srcPath)) {
+                $this->wpfoundry_copy_dir_recursive($srcPath, $dstPath);
+            } else {
+                if (!@copy($srcPath, $dstPath)) {
+                    throw new Exception('Failed to copy file: ' . $srcPath);
+                }
+            }
         }
     }
 
@@ -334,26 +388,9 @@ class WPFCommandRunner {
             $source_dir = dirname($main_file);
             $dest_dir = trailingslashit(WP_PLUGIN_DIR) . $slug_dir;
 
-            if (!function_exists('WP_Filesystem') || !function_exists('copy_dir')) {
-                require_once ABSPATH . 'wp-admin/includes/file.php';
-            }
-
-            WP_Filesystem();
-            global $wp_filesystem;
-            if (!$wp_filesystem) {
-                throw new Exception('WP_Filesystem could not be initialized');
-            }
-
-            // Replace plugin directory
-            $wp_filesystem->delete($dest_dir, true);
-            if (!wp_mkdir_p($dest_dir)) {
-                throw new Exception('Failed to recreate plugin directory');
-            }
-
-            $copy_result = copy_dir($source_dir, $dest_dir);
-            if (is_wp_error($copy_result)) {
-                throw new Exception('Copy failed: ' . $copy_result->get_error_message());
-            }
+            // Replace plugin directory (no WP_Filesystem; avoids FTP credential prompts)
+            $this->wpfoundry_delete_dir_recursive($dest_dir);
+            $this->wpfoundry_copy_dir_recursive($source_dir, $dest_dir);
 
             $this->wpfoundry_cleanup_dir_best_effort($extract_base);
 
