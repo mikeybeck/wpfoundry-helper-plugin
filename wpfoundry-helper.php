@@ -14,6 +14,15 @@ add_action('rest_api_init', function () {
             return current_user_can('administrator');
         },
     ]);
+
+    // Download a generated backup file by token (short-lived).
+    register_rest_route('wpfoundry/v1', '/download', [
+        'methods' => 'GET',
+        'callback' => 'wpf_download_file',
+        'permission_callback' => function () {
+            return current_user_can('administrator');
+        },
+    ]);
 });
 
 class WPFCommandRunner {
@@ -49,6 +58,12 @@ class WPFCommandRunner {
         switch ($subcommand) {
             case 'version':
                 $this->wpfoundry_version();
+                break;
+            case 'backup-plugin':
+                $this->wpfoundry_backup_plugin($args);
+                break;
+            case 'backup-theme':
+                $this->wpfoundry_backup_theme($args);
                 break;
             case 'core-version':
                 $this->execute_core_version_command();
@@ -631,6 +646,222 @@ class WPFCommandRunner {
         return $types[$extension] ?? 'unknown';
     }
 
+    private function wpfoundry_backup_plugin($args) {
+        $this->emit_event('command_start', [
+            'command' => 'wpfoundry backup-plugin ' . implode(' ', $args),
+            'wp_command' => 'wpfoundry',
+            'start_time' => microtime(true)
+        ]);
+
+        $slug = isset($args[0]) ? trim($args[0]) : '';
+        if (!$slug || !preg_match('/^[a-zA-Z0-9._-]+$/', $slug)) {
+            $this->emit_event('command_error', [
+                'error' => 'invalid_plugin_slug',
+                'message' => 'Missing or invalid plugin slug argument',
+                'exit_code' => 1,
+                'status' => 'error'
+            ]);
+            return;
+        }
+
+        try {
+            $base_dir = trailingslashit(WP_PLUGIN_DIR) . $slug;
+            $result = $this->wpfoundry_create_backup_zip_and_token($base_dir, $slug, 'plugin');
+
+            $payload = [
+                'status' => 'success',
+                'type' => 'plugin',
+                'slug' => $slug,
+                'token' => $result['token'],
+                'filename' => $result['filename'],
+                'size' => $result['size'],
+                'expires_in' => $result['expires_in'],
+            ];
+
+            $this->emit_event('command_data', [
+                'data' => [$payload],
+                'line_number' => 1,
+                'raw_line' => json_encode($payload)
+            ]);
+
+            $this->emit_event('command_complete', [
+                'exit_code' => 0,
+                'status' => 'success',
+                'total_lines' => 1,
+                'end_time' => microtime(true)
+            ]);
+        } catch (Exception $e) {
+            $this->emit_event('command_error', [
+                'error' => 'backup_plugin_failed',
+                'message' => $e->getMessage(),
+                'exit_code' => 1,
+                'status' => 'error'
+            ]);
+        }
+    }
+
+    private function wpfoundry_backup_theme($args) {
+        $this->emit_event('command_start', [
+            'command' => 'wpfoundry backup-theme ' . implode(' ', $args),
+            'wp_command' => 'wpfoundry',
+            'start_time' => microtime(true)
+        ]);
+
+        $slug = isset($args[0]) ? trim($args[0]) : '';
+        if (!$slug || !preg_match('/^[a-zA-Z0-9._-]+$/', $slug)) {
+            $this->emit_event('command_error', [
+                'error' => 'invalid_theme_slug',
+                'message' => 'Missing or invalid theme slug argument',
+                'exit_code' => 1,
+                'status' => 'error'
+            ]);
+            return;
+        }
+
+        try {
+            $theme_root = function_exists('get_theme_root') ? get_theme_root() : (WP_CONTENT_DIR . '/themes');
+            $base_dir = trailingslashit($theme_root) . $slug;
+            $result = $this->wpfoundry_create_backup_zip_and_token($base_dir, $slug, 'theme');
+
+            $payload = [
+                'status' => 'success',
+                'type' => 'theme',
+                'slug' => $slug,
+                'token' => $result['token'],
+                'filename' => $result['filename'],
+                'size' => $result['size'],
+                'expires_in' => $result['expires_in'],
+            ];
+
+            $this->emit_event('command_data', [
+                'data' => [$payload],
+                'line_number' => 1,
+                'raw_line' => json_encode($payload)
+            ]);
+
+            $this->emit_event('command_complete', [
+                'exit_code' => 0,
+                'status' => 'success',
+                'total_lines' => 1,
+                'end_time' => microtime(true)
+            ]);
+        } catch (Exception $e) {
+            $this->emit_event('command_error', [
+                'error' => 'backup_theme_failed',
+                'message' => $e->getMessage(),
+                'exit_code' => 1,
+                'status' => 'error'
+            ]);
+        }
+    }
+
+    private function wpfoundry_create_backup_zip_and_token($base_dir, $slug, $type) {
+        if (!is_dir($base_dir)) {
+            throw new Exception(ucfirst($type) . " directory does not exist: $base_dir");
+        }
+        if (!is_readable($base_dir)) {
+            throw new Exception(ucfirst($type) . " directory is not readable: $base_dir");
+        }
+
+        $zip_path = trailingslashit(sys_get_temp_dir()) . sprintf('wpfoundry-%s-%s-%s.zip', $type, $slug, uniqid('', true));
+
+        $metadata = [
+            'type' => $type,
+            'slug' => $slug,
+            'created_at' => time(),
+            'base_dir' => $base_dir,
+        ];
+        $metadata_json = json_encode($metadata, JSON_PRETTY_PRINT);
+
+        // Prefer ZipArchive, fall back to PclZip (bundled with WordPress) if needed.
+        if (class_exists('ZipArchive')) {
+            $zip = new ZipArchive();
+            $opened = $zip->open($zip_path, ZipArchive::CREATE | ZipArchive::OVERWRITE);
+            if ($opened !== true) {
+                throw new Exception('Failed to create zip (code ' . $opened . ')');
+            }
+
+            $zip->addFromString('backup-metadata.json', $metadata_json);
+
+            $base_norm = rtrim(str_replace('\\', '/', $base_dir), '/');
+            $iterator = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator($base_dir, FilesystemIterator::SKIP_DOTS),
+                RecursiveIteratorIterator::SELF_FIRST
+            );
+
+            foreach ($iterator as $file_info) {
+                /** @var SplFileInfo $file_info */
+                if ($file_info->isLink() || $file_info->isDir()) {
+                    continue;
+                }
+
+                $pathname = str_replace('\\', '/', $file_info->getPathname());
+                if (strpos($pathname, $base_norm . '/') !== 0 && $pathname !== $base_norm) {
+                    continue;
+                }
+
+                $rel = ltrim(substr($pathname, strlen($base_norm)), '/');
+                $zip->addFile($file_info->getPathname(), $slug . '/' . $rel);
+            }
+
+            $zip->close();
+        } else {
+            // PclZip fallback
+            if (!class_exists('PclZip')) {
+                // WordPress bundles it, but include just in case
+                $pclzip_path = ABSPATH . 'wp-admin/includes/class-pclzip.php';
+                if (file_exists($pclzip_path)) {
+                    require_once $pclzip_path;
+                }
+            }
+            if (!class_exists('PclZip')) {
+                throw new Exception('Neither ZipArchive nor PclZip are available on this server');
+            }
+
+            // Write metadata to a temp file so PclZip can include it
+            $meta_path = trailingslashit(sys_get_temp_dir()) . sprintf('wpfoundry-meta-%s-%s.json', $type, uniqid('', true));
+            if (@file_put_contents($meta_path, $metadata_json) === false) {
+                throw new Exception('Failed to write metadata temp file');
+            }
+
+            $archive = new PclZip($zip_path);
+            $meta_result = $archive->create($meta_path, PCLZIP_OPT_REMOVE_PATH, dirname($meta_path));
+            @unlink($meta_path);
+            if ($meta_result == 0) {
+                throw new Exception('PclZip failed to create archive: ' . $archive->errorInfo(true));
+            }
+
+            // Add plugin/theme files
+            $base_parent = dirname(rtrim($base_dir, '/\\'));
+            $add_result = $archive->add($base_dir, PCLZIP_OPT_REMOVE_PATH, $base_parent);
+            if ($add_result == 0) {
+                throw new Exception('PclZip failed to add files: ' . $archive->errorInfo(true));
+            }
+        }
+
+        $size = @filesize($zip_path);
+        if ($size === false) {
+            $size = 0;
+        }
+
+        $token = bin2hex(random_bytes(16));
+        $expires_in = 300;
+        $filename = sprintf('%s-%s-backup.zip', $type, $slug);
+
+        set_transient('wpf_dl_' . $token, [
+            'path' => $zip_path,
+            'filename' => $filename,
+            'created_at' => time(),
+        ], $expires_in);
+
+        return [
+            'token' => $token,
+            'filename' => $filename,
+            'size' => $size,
+            'expires_in' => $expires_in,
+        ];
+    }
+
     public function execute_command($command) {
         // Handle wpfoundry commands directly (bypass WP-CLI package issues)
         if (strpos($command, 'wpfoundry ') === 0) {
@@ -839,6 +1070,53 @@ function wpf_check_rate_limit() {
     set_transient($key, $data, 60);
 
     return true;
+}
+
+/**
+ * Download a generated backup file by token.
+ * Token is created by wpfoundry backup-plugin / backup-theme and stored in a transient.
+ */
+function wpf_download_file($request) {
+    $token = $request->get_param('token');
+    if (!$token || !is_string($token) || !preg_match('/^[a-f0-9]{32}$/', $token)) {
+        return new WP_Error('invalid_token', 'Missing or invalid token', ['status' => 400]);
+    }
+
+    $data = get_transient('wpf_dl_' . $token);
+    if (!$data || !is_array($data)) {
+        return new WP_Error('token_not_found', 'Token not found or expired', ['status' => 404]);
+    }
+
+    $path = isset($data['path']) ? $data['path'] : '';
+    $filename = isset($data['filename']) ? $data['filename'] : 'backup.zip';
+
+    if (!$path || !is_string($path) || !file_exists($path)) {
+        delete_transient('wpf_dl_' . $token);
+        return new WP_Error('file_not_found', 'Backup file not found', ['status' => 404]);
+    }
+
+    // Stream the file then clean up.
+    header('Content-Type: application/zip');
+    header('Content-Disposition: attachment; filename="' . basename($filename) . '"');
+    header('Content-Length: ' . filesize($path));
+    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+
+    $fh = fopen($path, 'rb');
+    if ($fh === false) {
+        delete_transient('wpf_dl_' . $token);
+        return new WP_Error('file_open_failed', 'Failed to open backup file', ['status' => 500]);
+    }
+
+    while (!feof($fh)) {
+        echo fread($fh, 1024 * 1024); // 1MB chunks
+        @ob_flush(); @flush();
+    }
+    fclose($fh);
+
+    @unlink($path);
+    delete_transient('wpf_dl_' . $token);
+
+    exit;
 }
 
 function wpf_run_command_sse($request) {
