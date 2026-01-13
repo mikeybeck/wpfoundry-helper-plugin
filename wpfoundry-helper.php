@@ -665,8 +665,20 @@ class WPFCommandRunner {
         }
 
         try {
-            $base_dir = trailingslashit(WP_PLUGIN_DIR) . $slug;
-            $result = $this->wpfoundry_create_backup_zip_and_token($base_dir, $slug, 'plugin');
+            // Support both directory plugins and single-file plugins (and common drop-ins like advanced-cache.php).
+            $plugin_path = trailingslashit(WP_PLUGIN_DIR) . $slug;
+            $content_dropin_path = trailingslashit(WP_CONTENT_DIR) . $slug;
+
+            $source_path = null;
+            if (is_dir($plugin_path) || is_file($plugin_path)) {
+                $source_path = $plugin_path;
+            } elseif (is_file($content_dropin_path)) {
+                $source_path = $content_dropin_path;
+            } else {
+                throw new Exception("Plugin directory does not exist: $plugin_path");
+            }
+
+            $result = $this->wpfoundry_create_backup_zip_and_token($source_path, $slug, 'plugin');
 
             $payload = [
                 'status' => 'success',
@@ -756,11 +768,12 @@ class WPFCommandRunner {
     }
 
     private function wpfoundry_create_backup_zip_and_token($base_dir, $slug, $type) {
-        if (!is_dir($base_dir)) {
-            throw new Exception(ucfirst($type) . " directory does not exist: $base_dir");
+        // $base_dir can be a directory (normal plugin/theme) or a file (single-file plugin / drop-in).
+        if (!file_exists($base_dir)) {
+            throw new Exception(ucfirst($type) . " path does not exist: $base_dir");
         }
         if (!is_readable($base_dir)) {
-            throw new Exception(ucfirst($type) . " directory is not readable: $base_dir");
+            throw new Exception(ucfirst($type) . " path is not readable: $base_dir");
         }
 
         // Token first so we can use deterministic file names (avoids relying solely on transients).
@@ -775,27 +788,32 @@ class WPFCommandRunner {
                 throw new Exception('Failed to create zip (code ' . $opened . ')');
             }
 
-            $base_norm = rtrim(str_replace('\\', '/', $base_dir), '/');
-            $iterator = new RecursiveIteratorIterator(
-                new RecursiveDirectoryIterator($base_dir, FilesystemIterator::SKIP_DOTS),
-                RecursiveIteratorIterator::SELF_FIRST
-            );
+            if (is_file($base_dir)) {
+                // Single-file plugin/drop-in: put file at zip root.
+                $zip->addFile($base_dir, basename($base_dir));
+            } else {
+                $base_norm = rtrim(str_replace('\\', '/', $base_dir), '/');
+                $iterator = new RecursiveIteratorIterator(
+                    new RecursiveDirectoryIterator($base_dir, FilesystemIterator::SKIP_DOTS),
+                    RecursiveIteratorIterator::SELF_FIRST
+                );
 
-            foreach ($iterator as $file_info) {
-                /** @var SplFileInfo $file_info */
-                if ($file_info->isLink() || $file_info->isDir()) {
-                    continue;
-                }
+                foreach ($iterator as $file_info) {
+                    /** @var SplFileInfo $file_info */
+                    if ($file_info->isLink() || $file_info->isDir()) {
+                        continue;
+                    }
 
-                $pathname = str_replace('\\', '/', $file_info->getPathname());
-                if (strpos($pathname, $base_norm . '/') !== 0 && $pathname !== $base_norm) {
-                    continue;
-                }
+                    $pathname = str_replace('\\', '/', $file_info->getPathname());
+                    if (strpos($pathname, $base_norm . '/') !== 0 && $pathname !== $base_norm) {
+                        continue;
+                    }
 
-                $rel = ltrim(substr($pathname, strlen($base_norm)), '/');
-                // Put plugin/theme files at zip root (no extra top-level directory).
-                if ($rel !== '') {
-                    $zip->addFile($file_info->getPathname(), $rel);
+                    $rel = ltrim(substr($pathname, strlen($base_norm)), '/');
+                    // Put plugin/theme files at zip root (no extra top-level directory).
+                    if ($rel !== '') {
+                        $zip->addFile($file_info->getPathname(), $rel);
+                    }
                 }
             }
 
@@ -814,11 +832,20 @@ class WPFCommandRunner {
             }
 
             $archive = new PclZip($zip_path);
-            // Create archive with plugin/theme contents at zip root.
-            $base_remove = rtrim($base_dir, '/\\');
-            $result = $archive->create($base_dir, PCLZIP_OPT_REMOVE_PATH, $base_remove);
-            if ($result == 0) {
-                throw new Exception('PclZip failed to add files: ' . $archive->errorInfo(true));
+            if (is_file($base_dir)) {
+                // Single-file plugin/drop-in: put file at zip root.
+                $base_remove = dirname($base_dir);
+                $result = $archive->create($base_dir, PCLZIP_OPT_REMOVE_PATH, $base_remove);
+                if ($result == 0) {
+                    throw new Exception('PclZip failed to add file: ' . $archive->errorInfo(true));
+                }
+            } else {
+                // Directory plugin/theme: put contents at zip root.
+                $base_remove = rtrim($base_dir, '/\\');
+                $result = $archive->create($base_dir, PCLZIP_OPT_REMOVE_PATH, $base_remove);
+                if ($result == 0) {
+                    throw new Exception('PclZip failed to add files: ' . $archive->errorInfo(true));
+                }
             }
         }
 
