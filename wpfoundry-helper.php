@@ -767,14 +767,6 @@ class WPFCommandRunner {
         $token = bin2hex(random_bytes(16));
         $zip_path = trailingslashit(sys_get_temp_dir()) . 'wpfoundry-dl-' . $token . '.zip';
 
-        $metadata = [
-            'type' => $type,
-            'slug' => $slug,
-            'created_at' => time(),
-            'base_dir' => $base_dir,
-        ];
-        $metadata_json = json_encode($metadata, JSON_PRETTY_PRINT);
-
         // Prefer ZipArchive, fall back to PclZip (bundled with WordPress) if needed.
         if (class_exists('ZipArchive')) {
             $zip = new ZipArchive();
@@ -782,8 +774,6 @@ class WPFCommandRunner {
             if ($opened !== true) {
                 throw new Exception('Failed to create zip (code ' . $opened . ')');
             }
-
-            $zip->addFromString('backup-metadata.json', $metadata_json);
 
             $base_norm = rtrim(str_replace('\\', '/', $base_dir), '/');
             $iterator = new RecursiveIteratorIterator(
@@ -803,7 +793,10 @@ class WPFCommandRunner {
                 }
 
                 $rel = ltrim(substr($pathname, strlen($base_norm)), '/');
-                $zip->addFile($file_info->getPathname(), $slug . '/' . $rel);
+                // Put plugin/theme files at zip root (no extra top-level directory).
+                if ($rel !== '') {
+                    $zip->addFile($file_info->getPathname(), $rel);
+                }
             }
 
             $zip->close();
@@ -820,23 +813,11 @@ class WPFCommandRunner {
                 throw new Exception('Neither ZipArchive nor PclZip are available on this server');
             }
 
-            // Write metadata to a temp file so PclZip can include it
-            $meta_path = trailingslashit(sys_get_temp_dir()) . sprintf('wpfoundry-meta-%s-%s.json', $type, uniqid('', true));
-            if (@file_put_contents($meta_path, $metadata_json) === false) {
-                throw new Exception('Failed to write metadata temp file');
-            }
-
             $archive = new PclZip($zip_path);
-            $meta_result = $archive->create($meta_path, PCLZIP_OPT_REMOVE_PATH, dirname($meta_path));
-            @unlink($meta_path);
-            if ($meta_result == 0) {
-                throw new Exception('PclZip failed to create archive: ' . $archive->errorInfo(true));
-            }
-
-            // Add plugin/theme files
-            $base_parent = dirname(rtrim($base_dir, '/\\'));
-            $add_result = $archive->add($base_dir, PCLZIP_OPT_REMOVE_PATH, $base_parent);
-            if ($add_result == 0) {
+            // Create archive with plugin/theme contents at zip root.
+            $base_remove = rtrim($base_dir, '/\\');
+            $result = $archive->create($base_dir, PCLZIP_OPT_REMOVE_PATH, $base_remove);
+            if ($result == 0) {
                 throw new Exception('PclZip failed to add files: ' . $archive->errorInfo(true));
             }
         }
