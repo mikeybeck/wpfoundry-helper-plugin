@@ -11,7 +11,8 @@ add_action('rest_api_init', function () {
         'methods' => 'POST',
         'callback' => 'wpf_run_command_sse',
         'permission_callback' => function () {
-            return current_user_can('administrator');
+            // Use a capability, not a role name.
+            return current_user_can('manage_options');
         },
     ]);
 
@@ -20,7 +21,8 @@ add_action('rest_api_init', function () {
         'methods' => 'GET',
         'callback' => 'wpf_download_file',
         'permission_callback' => function () {
-            return current_user_can('administrator');
+            // Use a capability, not a role name.
+            return current_user_can('manage_options');
         },
     ]);
 });
@@ -1054,7 +1056,15 @@ function wpf_validate_command($command) {
         'wp sidebar',
     ];
 
-    $command_start = strtolower(substr(trim($command), 0, 20));
+    // Normalize commands: the client often sends "db export -" (without "wp " prefix),
+    // but we always execute via WP-CLI (prefixing with "wp " later). Validate the
+    // normalized form so "db", "plugin", etc. are properly allowlisted.
+    $normalized = trim($command);
+    if (stripos($normalized, 'wp ') !== 0 && stripos($normalized, 'wpfoundry') !== 0) {
+        $normalized = 'wp ' . $normalized;
+    }
+
+    $command_start = strtolower(substr($normalized, 0, 20));
     foreach ($allowed_commands as $allowed) {
         if (strpos($command_start, $allowed) === 0) {
             return true;
@@ -1191,9 +1201,13 @@ function wpf_run_command_sse($request) {
     $command = $params['command'] ?? '';
 
     // SECURITY: Validate command input
-    if (empty($command) || !is_string($command) || !wpf_validate_command($command)) {
+    if (empty($command) || !is_string($command)) {
         header('Content-Type: application/json');
         return new WP_Error('empty_command', 'No command provided', ['status' => 400]);
+    }
+    if (!wpf_validate_command($command)) {
+        header('Content-Type: application/json');
+        return new WP_Error('invalid_command', 'Invalid or disallowed command', ['status' => 400]);
     }
 
     // Set headers for SSE
