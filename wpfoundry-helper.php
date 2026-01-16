@@ -67,6 +67,10 @@ class WPFCommandRunner {
             case 'backup-theme':
                 $this->wpfoundry_backup_theme($args);
                 break;
+            case 'backup-db':
+            case 'backup-database':
+                $this->wpfoundry_backup_db($args);
+                break;
             case 'core-version':
                 $this->execute_core_version_command();
                 break;
@@ -766,6 +770,87 @@ class WPFCommandRunner {
                 'exit_code' => 1,
                 'status' => 'error'
             ]);
+        }
+    }
+
+    private function wpfoundry_backup_db($args) {
+        $this->emit_event('command_start', [
+            'command' => 'wpfoundry backup-db',
+            'wp_command' => 'wpfoundry',
+            'start_time' => microtime(true)
+        ]);
+
+        $db_name = defined('DB_NAME') ? DB_NAME : 'database';
+        $slug = preg_replace('/[^a-zA-Z0-9._-]+/', '-', $db_name);
+        $tmp_sql = trailingslashit(sys_get_temp_dir()) . 'wpfoundry-db-' . uniqid('', true) . '.sql';
+
+        try {
+            // Export DB to a temporary SQL file.
+            $descriptorspec = [
+                1 => ['pipe', 'w'], // stdout
+                2 => ['pipe', 'w'], // stderr
+            ];
+
+            $command_to_run = 'wp db export ' . escapeshellarg($tmp_sql);
+            $env = $_ENV;
+            $env['WP_CLI_CACHE_DIR'] = sys_get_temp_dir() . '/wp-cli-cache';
+
+            $process = proc_open($command_to_run . " 2>&1", $descriptorspec, $pipes, ABSPATH, $env);
+            if (!is_resource($process)) {
+                throw new Exception('Failed to start WP-CLI process for db export');
+            }
+
+            $output = stream_get_contents($pipes[1]);
+            fclose($pipes[1]);
+            $exit_code = proc_close($process);
+
+            if ($exit_code !== 0) {
+                $msg = trim($output);
+                if ($msg === '') {
+                    $msg = 'Unknown error during db export';
+                }
+                throw new Exception('DB export failed: ' . $msg);
+            }
+
+            if (!file_exists($tmp_sql) || !is_readable($tmp_sql)) {
+                throw new Exception('DB export failed: SQL file not created');
+            }
+
+            $result = $this->wpfoundry_create_backup_zip_and_token($tmp_sql, $slug, 'database');
+
+            $payload = [
+                'status' => 'success',
+                'type' => 'database',
+                'slug' => $slug,
+                'token' => $result['token'],
+                'filename' => $result['filename'],
+                'size' => $result['size'],
+                'expires_in' => $result['expires_in'],
+            ];
+
+            $this->emit_event('command_data', [
+                'data' => [$payload],
+                'line_number' => 1,
+                'raw_line' => json_encode($payload)
+            ]);
+
+            $this->emit_event('command_complete', [
+                'exit_code' => 0,
+                'status' => 'success',
+                'total_lines' => 1,
+                'end_time' => microtime(true)
+            ]);
+        } catch (Exception $e) {
+            $this->emit_event('command_error', [
+                'error' => 'backup_db_failed',
+                'message' => $e->getMessage(),
+                'exit_code' => 1,
+                'status' => 'error'
+            ]);
+        } finally {
+            if (isset($tmp_sql) && is_string($tmp_sql) && file_exists($tmp_sql)) {
+                @unlink($tmp_sql);
+            }
         }
     }
 
