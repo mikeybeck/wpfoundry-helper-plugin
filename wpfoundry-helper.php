@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 3.9
+Version: 3.10
 Author: Mikey
 */
 
@@ -70,6 +70,10 @@ class WPFCommandRunner {
             case 'backup-db':
             case 'backup-database':
                 $this->wpfoundry_backup_db($args);
+                break;
+            case 'backup-content':
+            case 'backup-wp-content':
+                $this->wpfoundry_backup_wp_content($args);
                 break;
             case 'core-version':
                 $this->execute_core_version_command();
@@ -851,6 +855,197 @@ class WPFCommandRunner {
             if (isset($tmp_sql) && is_string($tmp_sql) && file_exists($tmp_sql)) {
                 @unlink($tmp_sql);
             }
+        }
+    }
+
+    private function wpfoundry_backup_wp_content($args) {
+        $this->emit_event('command_start', [
+            'command' => 'wpfoundry backup-content ' . implode(' ', $args),
+            'wp_command' => 'wpfoundry',
+            'start_time' => microtime(true)
+        ]);
+
+        $include_uploads = true;
+        foreach ($args as $arg) {
+            $arg = strtolower(trim($arg));
+            if (in_array($arg, ['--no-uploads', 'no-uploads', '--exclude-uploads', 'exclude-uploads'], true)) {
+                $include_uploads = false;
+            }
+        }
+
+        try {
+            $source_dir = WP_CONTENT_DIR;
+            if (!is_dir($source_dir)) {
+                throw new Exception('wp-content directory not found');
+            }
+
+            $source_dir = realpath($source_dir);
+            if ($source_dir === false) {
+                throw new Exception('wp-content directory not found');
+            }
+
+            $uploads_info = wp_upload_dir();
+            if (!empty($uploads_info['error'])) {
+                throw new Exception($uploads_info['error']);
+            }
+            $uploads_dir = isset($uploads_info['basedir']) ? realpath($uploads_info['basedir']) : false;
+
+            $token = bin2hex(random_bytes(16));
+            $zip_path = trailingslashit(sys_get_temp_dir()) . 'wpfoundry-dl-' . $token . '.zip';
+            $root_name = basename($source_dir);
+
+            if (class_exists('ZipArchive')) {
+                $zip = new ZipArchive();
+                $opened = $zip->open($zip_path, ZipArchive::CREATE | ZipArchive::OVERWRITE);
+                if ($opened !== true) {
+                    throw new Exception('Failed to create zip (code ' . $opened . ')');
+                }
+
+                $zip->addEmptyDir($root_name);
+
+                $iterator = new RecursiveIteratorIterator(
+                    new RecursiveDirectoryIterator($source_dir, FilesystemIterator::SKIP_DOTS),
+                    RecursiveIteratorIterator::SELF_FIRST
+                );
+
+                foreach ($iterator as $file_info) {
+                    /** @var SplFileInfo $file_info */
+                    if ($file_info->isLink()) {
+                        continue;
+                    }
+
+                    $file_path = $file_info->getRealPath();
+                    if ($file_path === false) {
+                        continue;
+                    }
+
+                    if (
+                        !$include_uploads
+                        && $uploads_dir
+                        && ($file_path === $uploads_dir || strpos($file_path, $uploads_dir . DIRECTORY_SEPARATOR) === 0)
+                    ) {
+                        continue;
+                    }
+
+                    $relative = ltrim(str_replace($source_dir, '', $file_path), DIRECTORY_SEPARATOR);
+                    if ($relative === '') {
+                        continue;
+                    }
+
+                    $zip_entry = $root_name . '/' . $relative;
+                    if ($file_info->isDir()) {
+                        $zip->addEmptyDir($zip_entry);
+                        continue;
+                    }
+
+                    $zip->addFile($file_path, $zip_entry);
+                }
+
+                $zip->close();
+            } else {
+                if (!class_exists('PclZip')) {
+                    $pclzip_path = ABSPATH . 'wp-admin/includes/class-pclzip.php';
+                    if (file_exists($pclzip_path)) {
+                        require_once $pclzip_path;
+                    }
+                }
+                if (!class_exists('PclZip')) {
+                    throw new Exception('Neither ZipArchive nor PclZip are available on this server');
+                }
+
+                $file_list = [];
+                $iterator = new RecursiveIteratorIterator(
+                    new RecursiveDirectoryIterator($source_dir, FilesystemIterator::SKIP_DOTS),
+                    RecursiveIteratorIterator::SELF_FIRST
+                );
+
+                foreach ($iterator as $file_info) {
+                    /** @var SplFileInfo $file_info */
+                    if ($file_info->isLink() || $file_info->isDir()) {
+                        continue;
+                    }
+
+                    $file_path = $file_info->getRealPath();
+                    if ($file_path === false) {
+                        continue;
+                    }
+
+                    if (
+                        !$include_uploads
+                        && $uploads_dir
+                        && ($file_path === $uploads_dir || strpos($file_path, $uploads_dir . DIRECTORY_SEPARATOR) === 0)
+                    ) {
+                        continue;
+                    }
+
+                    $file_list[] = $file_info->getPathname();
+                }
+
+                $archive = new PclZip($zip_path);
+                $result = $archive->create(
+                    $file_list,
+                    PCLZIP_OPT_REMOVE_PATH, $source_dir,
+                    PCLZIP_OPT_ADD_PATH, $root_name
+                );
+                if ($result == 0) {
+                    throw new Exception('PclZip failed to add files: ' . $archive->errorInfo(true));
+                }
+            }
+
+            $size = @filesize($zip_path);
+            if ($size === false) {
+                $size = 0;
+            }
+
+            $expires_in = 300;
+            $expires_at = time() + $expires_in;
+            $filename = $include_uploads ? 'wp-content-backup.zip' : 'wp-content-backup-no-uploads.zip';
+
+            set_transient('wpf_dl_' . $token, [
+                'path' => $zip_path,
+                'filename' => $filename,
+                'created_at' => time(),
+                'expires_at' => $expires_at,
+            ], $expires_in);
+
+            $token_file = trailingslashit(sys_get_temp_dir()) . 'wpfoundry-dl-' . $token . '.json';
+            @file_put_contents($token_file, json_encode([
+                'path' => $zip_path,
+                'filename' => $filename,
+                'created_at' => time(),
+                'expires_at' => $expires_at,
+            ]));
+
+            $payload = [
+                'status' => 'success',
+                'type' => 'content',
+                'slug' => 'wp-content',
+                'token' => $token,
+                'filename' => $filename,
+                'size' => $size,
+                'expires_in' => $expires_in,
+                'include_uploads' => $include_uploads,
+            ];
+
+            $this->emit_event('command_data', [
+                'data' => [$payload],
+                'line_number' => 1,
+                'raw_line' => json_encode($payload)
+            ]);
+
+            $this->emit_event('command_complete', [
+                'exit_code' => 0,
+                'status' => 'success',
+                'total_lines' => 1,
+                'end_time' => microtime(true)
+            ]);
+        } catch (Exception $e) {
+            $this->emit_event('command_error', [
+                'error' => 'backup_content_failed',
+                'message' => $e->getMessage(),
+                'exit_code' => 1,
+                'status' => 'error'
+            ]);
         }
     }
 
