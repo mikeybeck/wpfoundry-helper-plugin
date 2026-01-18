@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 3.10
+Version: 3.11
 Author: Mikey
 */
 
@@ -865,6 +865,10 @@ class WPFCommandRunner {
             'start_time' => microtime(true)
         ]);
 
+        @ini_set('max_execution_time', '0');
+        @set_time_limit(0);
+        @ignore_user_abort(true);
+
         $include_uploads = true;
         foreach ($args as $arg) {
             $arg = strtolower(trim($arg));
@@ -874,6 +878,10 @@ class WPFCommandRunner {
         }
 
         try {
+            $start_time = microtime(true);
+            $last_emit = $start_time;
+            $processed = 0;
+
             $source_dir = WP_CONTENT_DIR;
             if (!is_dir($source_dir)) {
                 throw new Exception('wp-content directory not found');
@@ -935,10 +943,26 @@ class WPFCommandRunner {
                     $zip_entry = $root_name . '/' . $relative;
                     if ($file_info->isDir()) {
                         $zip->addEmptyDir($zip_entry);
+                        $processed++;
+                        if (microtime(true) - $last_emit > 2) {
+                            $this->emit_event('command_progress', [
+                                'lines_processed' => $processed,
+                                'elapsed_time' => microtime(true) - $start_time
+                            ]);
+                            $last_emit = microtime(true);
+                        }
                         continue;
                     }
 
                     $zip->addFile($file_path, $zip_entry);
+                    $processed++;
+                    if (microtime(true) - $last_emit > 2) {
+                        $this->emit_event('command_progress', [
+                            'lines_processed' => $processed,
+                            'elapsed_time' => microtime(true) - $start_time
+                        ]);
+                        $last_emit = microtime(true);
+                    }
                 }
 
                 $zip->close();
@@ -979,6 +1003,14 @@ class WPFCommandRunner {
                     }
 
                     $file_list[] = $file_info->getPathname();
+                    $processed++;
+                    if (microtime(true) - $last_emit > 2) {
+                        $this->emit_event('command_progress', [
+                            'lines_processed' => $processed,
+                            'elapsed_time' => microtime(true) - $start_time
+                        ]);
+                        $last_emit = microtime(true);
+                    }
                 }
 
                 $archive = new PclZip($zip_path);
@@ -1494,10 +1526,23 @@ function wpf_run_command_sse($request) {
     header('Content-Type: text/event-stream');
     header('Cache-Control: no-cache');
     header('Connection: keep-alive');
+    header('X-Accel-Buffering: no');
     header('Access-Control-Allow-Origin: *');
     header('Access-Control-Allow-Headers: Content-Type');
-    @ob_end_clean();
+    @ini_set('output_buffering', 'off');
+    @ini_set('zlib.output_compression', '0');
+    @ini_set('max_execution_time', '0');
+    @set_time_limit(0);
+    @ignore_user_abort(true);
+    if (function_exists('apache_setenv')) {
+        @apache_setenv('no-gzip', '1');
+    }
+    while (ob_get_level() > 0) {
+        @ob_end_flush();
+    }
     @flush();
+    echo ": ping\n\n";
+    @ob_flush(); @flush();
 
     try {
         $runner = new WPFCommandRunner();
