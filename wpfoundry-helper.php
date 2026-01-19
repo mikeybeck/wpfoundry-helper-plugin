@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 3.11
+Version: 3.12
 Author: Mikey
 */
 
@@ -20,6 +20,26 @@ add_action('rest_api_init', function () {
     register_rest_route('wpfoundry/v1', '/download', [
         'methods' => 'GET',
         'callback' => 'wpf_download_file',
+        'permission_callback' => function () {
+            // Use a capability, not a role name.
+            return current_user_can('manage_options');
+        },
+    ]);
+
+    // Upload a zip file for plugin/theme installation.
+    register_rest_route('wpfoundry/v1', '/upload', [
+        'methods' => 'POST',
+        'callback' => 'wpf_upload_file',
+        'permission_callback' => function () {
+            // Use a capability, not a role name.
+            return current_user_can('manage_options');
+        },
+    ]);
+
+    // Delete an uploaded file by token.
+    register_rest_route('wpfoundry/v1', '/upload-delete', [
+        'methods' => 'POST',
+        'callback' => 'wpf_delete_uploaded_file',
         'permission_callback' => function () {
             // Use a capability, not a role name.
             return current_user_can('manage_options');
@@ -1499,6 +1519,84 @@ function wpf_download_file($request) {
     @unlink($token_file);
 
     exit;
+}
+
+/**
+ * Upload a zip file for plugin/theme installation.
+ */
+function wpf_upload_file($request) {
+    $files = $request->get_file_params();
+    if (empty($files['file'])) {
+        return new WP_Error('missing_file', 'No file uploaded', ['status' => 400]);
+    }
+
+    if (!function_exists('wp_unique_filename')) {
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+    }
+
+    $file = $files['file'];
+    $tmp_name = $file['tmp_name'] ?? '';
+    if (!$tmp_name || !is_uploaded_file($tmp_name)) {
+        return new WP_Error('invalid_upload', 'Invalid upload data', ['status' => 400]);
+    }
+
+    $original_name = sanitize_file_name($file['name'] ?? 'upload.zip');
+    $extension = strtolower(pathinfo($original_name, PATHINFO_EXTENSION));
+    if ($extension !== 'zip') {
+        return new WP_Error('invalid_file_type', 'Only zip files are supported', ['status' => 400]);
+    }
+
+    $base_dir = trailingslashit(sys_get_temp_dir()) . 'wpfoundry-uploads';
+    if (!wp_mkdir_p($base_dir)) {
+        return new WP_Error('upload_dir_failed', 'Failed to create upload directory', ['status' => 500]);
+    }
+
+    $safe_name = wp_unique_filename($base_dir, $original_name);
+    $dest_path = trailingslashit($base_dir) . $safe_name;
+    if (!move_uploaded_file($tmp_name, $dest_path)) {
+        return new WP_Error('upload_move_failed', 'Failed to move uploaded file', ['status' => 500]);
+    }
+
+    $token = bin2hex(random_bytes(16));
+    $size = filesize($dest_path);
+    $payload = [
+        'path' => $dest_path,
+        'filename' => $safe_name,
+        'created_at' => time(),
+        'expires_at' => time() + 600,
+        'size' => $size !== false ? $size : 0,
+    ];
+    set_transient('wpf_upload_' . $token, $payload, 600);
+
+    return rest_ensure_response([
+        'success' => true,
+        'token' => $token,
+        'path' => $dest_path,
+        'filename' => $safe_name,
+        'size' => $payload['size'],
+        'expires_in' => 600,
+    ]);
+}
+
+/**
+ * Delete an uploaded zip file by token.
+ */
+function wpf_delete_uploaded_file($request) {
+    $token = $request->get_param('token');
+    if (!$token || !is_string($token) || !preg_match('/^[a-f0-9]{32}$/', $token)) {
+        return new WP_Error('invalid_token', 'Missing or invalid token', ['status' => 400]);
+    }
+
+    $data = get_transient('wpf_upload_' . $token);
+    if (is_array($data) && !empty($data['path']) && file_exists($data['path'])) {
+        @unlink($data['path']);
+    }
+    delete_transient('wpf_upload_' . $token);
+
+    return rest_ensure_response([
+        'success' => true,
+        'deleted' => true,
+    ]);
 }
 
 function wpf_run_command_sse($request) {
