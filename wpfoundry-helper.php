@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 3.12
+Version: 3.13
 Author: Mikey
 */
 
@@ -10,42 +10,88 @@ add_action('rest_api_init', function () {
     register_rest_route('wpfoundry/v1', '/run', [
         'methods' => 'POST',
         'callback' => 'wpf_run_command_sse',
-        'permission_callback' => function () {
-            // Use a capability, not a role name.
-            return current_user_can('manage_options');
-        },
+        'permission_callback' => 'wpf_verify_hmac_auth',
     ]);
 
     // Download a generated backup file by token (short-lived).
     register_rest_route('wpfoundry/v1', '/download', [
         'methods' => 'GET',
         'callback' => 'wpf_download_file',
-        'permission_callback' => function () {
-            // Use a capability, not a role name.
-            return current_user_can('manage_options');
-        },
+        'permission_callback' => 'wpf_verify_hmac_auth',
     ]);
 
     // Upload a zip file for plugin/theme installation.
     register_rest_route('wpfoundry/v1', '/upload', [
         'methods' => 'POST',
         'callback' => 'wpf_upload_file',
-        'permission_callback' => function () {
-            // Use a capability, not a role name.
-            return current_user_can('manage_options');
-        },
+        'permission_callback' => 'wpf_verify_hmac_auth',
     ]);
 
     // Delete an uploaded file by token.
     register_rest_route('wpfoundry/v1', '/upload-delete', [
         'methods' => 'POST',
         'callback' => 'wpf_delete_uploaded_file',
-        'permission_callback' => function () {
-            // Use a capability, not a role name.
-            return current_user_can('manage_options');
-        },
+        'permission_callback' => 'wpf_verify_hmac_auth',
     ]);
 });
+
+register_activation_hook(__FILE__, 'wpfoundry_helper_activate');
+add_action('admin_menu', 'wpfoundry_register_settings_page');
+
+function wpfoundry_helper_activate() {
+    wpfoundry_get_shared_secret(true);
+}
+
+function wpfoundry_register_settings_page() {
+    add_options_page(
+        'WP Foundry Helper',
+        'WP Foundry Helper',
+        'manage_options',
+        'wpfoundry-helper',
+        'wpfoundry_render_settings_page'
+    );
+}
+
+function wpfoundry_render_settings_page() {
+    if (!current_user_can('manage_options')) {
+        return;
+    }
+
+    $message = '';
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['wpfoundry_regenerate_secret'])) {
+        check_admin_referer('wpfoundry_regenerate_secret');
+        wpfoundry_get_shared_secret(true);
+        $message = 'Shared secret regenerated. Update your WP Foundry site settings.';
+    }
+
+    $secret = wpfoundry_get_shared_secret(false);
+    ?>
+    <div class="wrap">
+        <h1>WP Foundry Helper</h1>
+        <p>Use the shared secret below to pair this site with WP Foundry.</p>
+        <?php if ($message) : ?>
+            <div class="notice notice-success"><p><?php echo esc_html($message); ?></p></div>
+        <?php endif; ?>
+        <table class="form-table" role="presentation">
+            <tr>
+                <th scope="row">Shared secret</th>
+                <td>
+                    <input type="text" class="regular-text" readonly value="<?php echo esc_attr($secret); ?>" />
+                    <p class="description">Keep this secret private. Regenerating will revoke existing access.</p>
+                </td>
+            </tr>
+        </table>
+        <form method="post">
+            <?php wp_nonce_field('wpfoundry_regenerate_secret'); ?>
+            <p>
+                <button type="submit" name="wpfoundry_regenerate_secret" class="button button-secondary">
+                    Regenerate secret
+                </button>
+            </p>
+        </form>
+    </div>
+    <?php
+}
 
 class WPFCommandRunner {
 
@@ -1406,6 +1452,104 @@ function wpf_validate_command($command) {
     return false;
 }
 
+function wpfoundry_get_shared_secret($force_regenerate = false) {
+    $secret = get_option('wpfoundry_shared_secret');
+    if ($force_regenerate || !$secret || !is_string($secret) || strlen($secret) < 32) {
+        $secret = bin2hex(random_bytes(32));
+        update_option('wpfoundry_shared_secret', $secret, false);
+    }
+    return $secret;
+}
+
+function wpfoundry_get_header_value($request, $header_name) {
+    $value = $request->get_header($header_name);
+    return is_string($value) ? trim($value) : '';
+}
+
+function wpfoundry_canonical_query($params) {
+    if (!is_array($params) || empty($params)) {
+        return '';
+    }
+
+    ksort($params);
+    $pairs = [];
+    foreach ($params as $key => $value) {
+        if (is_array($value)) {
+            sort($value);
+            foreach ($value as $item) {
+                $pairs[] = rawurlencode((string) $key) . '=' . rawurlencode((string) $item);
+            }
+        } else {
+            $pairs[] = rawurlencode((string) $key) . '=' . rawurlencode((string) $value);
+        }
+    }
+
+    return implode('&', $pairs);
+}
+
+function wpfoundry_is_nonce_used($nonce) {
+    $key = 'wpf_nonce_' . hash('sha256', $nonce);
+    return (bool) get_transient($key);
+}
+
+function wpfoundry_store_nonce($nonce, $ttl_seconds) {
+    $key = 'wpf_nonce_' . hash('sha256', $nonce);
+    set_transient($key, time(), $ttl_seconds);
+}
+
+function wpf_verify_hmac_auth($request) {
+    $signature = wpfoundry_get_header_value($request, 'x-wpf-signature');
+    $timestamp = wpfoundry_get_header_value($request, 'x-wpf-ts');
+    $nonce = wpfoundry_get_header_value($request, 'x-wpf-nonce');
+    $body_hash = wpfoundry_get_header_value($request, 'x-wpf-body-sha256');
+    $request_id = wpfoundry_get_header_value($request, 'x-wpf-request-id');
+
+    if ($signature === '' || $timestamp === '' || $nonce === '' || $body_hash === '') {
+        return new WP_Error('wpf_auth_missing', 'Missing authentication headers', ['status' => 401]);
+    }
+
+    if (!preg_match('/^[a-f0-9]{64}$/i', $body_hash)) {
+        return new WP_Error('wpf_auth_invalid', 'Invalid body hash', ['status' => 401]);
+    }
+
+    if (!preg_match('/^[a-f0-9]{16,128}$/i', $nonce)) {
+        return new WP_Error('wpf_auth_invalid', 'Invalid nonce', ['status' => 401]);
+    }
+
+    $ts_int = intval($timestamp);
+    if ($ts_int <= 0 || abs(time() - $ts_int) > 300) {
+        return new WP_Error('wpf_auth_expired', 'Request timestamp out of range', ['status' => 401]);
+    }
+
+    if (wpfoundry_is_nonce_used($nonce)) {
+        return new WP_Error('wpf_auth_replay', 'Nonce already used', ['status' => 401]);
+    }
+
+    $method = strtoupper($request->get_method());
+    $route = $request->get_route();
+    $query = wpfoundry_canonical_query($request->get_query_params());
+
+    $base_string = implode("\n", [
+        $method,
+        $route,
+        $query,
+        strtolower($body_hash),
+        (string) $ts_int,
+        strtolower($nonce),
+        $request_id,
+    ]);
+
+    $secret = wpfoundry_get_shared_secret(false);
+    $expected = hash_hmac('sha256', $base_string, $secret);
+
+    if (!hash_equals($expected, strtolower($signature))) {
+        return new WP_Error('wpf_auth_failed', 'Invalid signature', ['status' => 401]);
+    }
+
+    wpfoundry_store_nonce($nonce, 600);
+    return true;
+}
+
 // Simple rate limiter to prevent abuse
 function wpf_check_rate_limit() {
     $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
@@ -1626,7 +1770,7 @@ function wpf_run_command_sse($request) {
     header('Connection: keep-alive');
     header('X-Accel-Buffering: no');
     header('Access-Control-Allow-Origin: *');
-    header('Access-Control-Allow-Headers: Content-Type');
+    header('Access-Control-Allow-Headers: Content-Type, X-WPF-TS, X-WPF-Nonce, X-WPF-Signature, X-WPF-Request-Id, X-WPF-Body-SHA256');
     @ini_set('output_buffering', 'off');
     @ini_set('zlib.output_compression', '0');
     @ini_set('max_execution_time', '0');
