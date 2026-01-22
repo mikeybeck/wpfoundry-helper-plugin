@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 3.13
+Version: 3.14
 Author: Mikey
 */
 
@@ -35,11 +35,16 @@ add_action('rest_api_init', function () {
     ]);
 });
 
+add_action('init', 'wpfoundry_register_rewrite');
+add_filter('query_vars', 'wpfoundry_register_query_vars');
+add_action('template_redirect', 'wpfoundry_handle_custom_endpoint');
 register_activation_hook(__FILE__, 'wpfoundry_helper_activate');
 add_action('admin_menu', 'wpfoundry_register_settings_page');
 
 function wpfoundry_helper_activate() {
     wpfoundry_get_shared_secret(true);
+    wpfoundry_register_rewrite();
+    flush_rewrite_rules();
 }
 
 function wpfoundry_register_settings_page() {
@@ -91,6 +96,58 @@ function wpfoundry_render_settings_page() {
         </form>
     </div>
     <?php
+}
+
+function wpfoundry_register_rewrite() {
+    add_rewrite_rule('^wp-foundry/v1/endpoint/?$', 'index.php?wpfoundry_endpoint=1', 'top');
+}
+
+function wpfoundry_register_query_vars($vars) {
+    $vars[] = 'wpfoundry_endpoint';
+    return $vars;
+}
+
+function wpfoundry_handle_custom_endpoint() {
+    if (intval(get_query_var('wpfoundry_endpoint')) !== 1) {
+        return;
+    }
+
+    if (strtoupper($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
+        status_header(405);
+        header('Content-Type: application/json');
+        echo json_encode(['error' => 'method_not_allowed']);
+        exit;
+    }
+
+    $raw_body = file_get_contents('php://input');
+    $body = is_string($raw_body) ? $raw_body : '';
+    $headers = wpfoundry_get_request_headers();
+
+    $auth_result = wpf_verify_hmac_from_parts(
+        'POST',
+        '/wp-foundry/v1/endpoint',
+        wpfoundry_canonical_query($_GET),
+        $body,
+        $headers
+    );
+    if ($auth_result !== true) {
+        status_header(401);
+        header('Content-Type: application/json');
+        echo json_encode(['error' => 'Unauthorized']);
+        exit;
+    }
+
+    if (is_user_logged_in() && !current_user_can('update_plugins')) {
+        status_header(403);
+        header('Content-Type: application/json');
+        echo json_encode(['error' => 'Forbidden']);
+        exit;
+    }
+
+    $decoded = json_decode($body, true);
+    $command = is_array($decoded) ? ($decoded['command'] ?? '') : '';
+
+    wpf_run_command_sse_with_command($command);
 }
 
 class WPFCommandRunner {
@@ -1466,6 +1523,39 @@ function wpfoundry_get_header_value($request, $header_name) {
     return is_string($value) ? trim($value) : '';
 }
 
+function wpfoundry_get_request_headers() {
+    if (function_exists('getallheaders')) {
+        $headers = getallheaders();
+        if (is_array($headers)) {
+            return $headers;
+        }
+    }
+
+    $headers = [];
+    foreach ($_SERVER as $key => $value) {
+        if (strpos($key, 'HTTP_') === 0) {
+            $name = str_replace(' ', '-', ucwords(strtolower(str_replace('_', ' ', substr($key, 5)))));
+            $headers[$name] = $value;
+        }
+    }
+    return $headers;
+}
+
+function wpfoundry_get_header_from_array($headers, $header_name) {
+    if (!is_array($headers)) {
+        return '';
+    }
+
+    $needle = strtolower($header_name);
+    foreach ($headers as $key => $value) {
+        if (strtolower($key) === $needle) {
+            return is_string($value) ? trim($value) : '';
+        }
+    }
+
+    return '';
+}
+
 function wpfoundry_canonical_query($params) {
     if (!is_array($params) || empty($params)) {
         return '';
@@ -1497,40 +1587,41 @@ function wpfoundry_store_nonce($nonce, $ttl_seconds) {
     set_transient($key, time(), $ttl_seconds);
 }
 
-function wpf_verify_hmac_auth($request) {
-    $signature = wpfoundry_get_header_value($request, 'x-wpf-signature');
-    $timestamp = wpfoundry_get_header_value($request, 'x-wpf-ts');
-    $nonce = wpfoundry_get_header_value($request, 'x-wpf-nonce');
-    $body_hash = wpfoundry_get_header_value($request, 'x-wpf-body-sha256');
-    $request_id = wpfoundry_get_header_value($request, 'x-wpf-request-id');
+function wpf_verify_hmac_from_parts($method, $route, $query, $body, $headers) {
+    $signature = wpfoundry_get_header_from_array($headers, 'x-wpf-signature');
+    $timestamp = wpfoundry_get_header_from_array($headers, 'x-wpf-ts');
+    $nonce = wpfoundry_get_header_from_array($headers, 'x-wpf-nonce');
+    $body_hash = wpfoundry_get_header_from_array($headers, 'x-wpf-body-sha256');
+    $request_id = wpfoundry_get_header_from_array($headers, 'x-wpf-request-id');
 
     if ($signature === '' || $timestamp === '' || $nonce === '' || $body_hash === '') {
-        return new WP_Error('wpf_auth_missing', 'Missing authentication headers', ['status' => 401]);
+        return new WP_Error('wpf_auth_failed', 'Unauthorized', ['status' => 401]);
     }
 
     if (!preg_match('/^[a-f0-9]{64}$/i', $body_hash)) {
-        return new WP_Error('wpf_auth_invalid', 'Invalid body hash', ['status' => 401]);
+        return new WP_Error('wpf_auth_failed', 'Unauthorized', ['status' => 401]);
     }
 
     if (!preg_match('/^[a-f0-9]{16,128}$/i', $nonce)) {
-        return new WP_Error('wpf_auth_invalid', 'Invalid nonce', ['status' => 401]);
+        return new WP_Error('wpf_auth_failed', 'Unauthorized', ['status' => 401]);
     }
 
     $ts_int = intval($timestamp);
     if ($ts_int <= 0 || abs(time() - $ts_int) > 300) {
-        return new WP_Error('wpf_auth_expired', 'Request timestamp out of range', ['status' => 401]);
+        return new WP_Error('wpf_auth_failed', 'Unauthorized', ['status' => 401]);
     }
 
     if (wpfoundry_is_nonce_used($nonce)) {
-        return new WP_Error('wpf_auth_replay', 'Nonce already used', ['status' => 401]);
+        return new WP_Error('wpf_auth_failed', 'Unauthorized', ['status' => 401]);
     }
 
-    $method = strtoupper($request->get_method());
-    $route = $request->get_route();
-    $query = wpfoundry_canonical_query($request->get_query_params());
+    $computed_body_hash = hash('sha256', is_string($body) ? $body : '');
+    if (!hash_equals(strtolower($body_hash), strtolower($computed_body_hash))) {
+        return new WP_Error('wpf_auth_failed', 'Unauthorized', ['status' => 401]);
+    }
 
     $base_string = implode("\n", [
-        $method,
+        strtoupper($method),
         $route,
         $query,
         strtolower($body_hash),
@@ -1543,11 +1634,29 @@ function wpf_verify_hmac_auth($request) {
     $expected = hash_hmac('sha256', $base_string, $secret);
 
     if (!hash_equals($expected, strtolower($signature))) {
-        return new WP_Error('wpf_auth_failed', 'Invalid signature', ['status' => 401]);
+        return new WP_Error('wpf_auth_failed', 'Unauthorized', ['status' => 401]);
     }
 
     wpfoundry_store_nonce($nonce, 600);
     return true;
+}
+
+function wpf_verify_hmac_auth($request) {
+    $headers = [
+        'x-wpf-signature' => wpfoundry_get_header_value($request, 'x-wpf-signature'),
+        'x-wpf-ts' => wpfoundry_get_header_value($request, 'x-wpf-ts'),
+        'x-wpf-nonce' => wpfoundry_get_header_value($request, 'x-wpf-nonce'),
+        'x-wpf-body-sha256' => wpfoundry_get_header_value($request, 'x-wpf-body-sha256'),
+        'x-wpf-request-id' => wpfoundry_get_header_value($request, 'x-wpf-request-id'),
+    ];
+
+    return wpf_verify_hmac_from_parts(
+        $request->get_method(),
+        $request->get_route(),
+        wpfoundry_canonical_query($request->get_query_params()),
+        $request->get_body(),
+        $headers
+    );
 }
 
 // Simple rate limiter to prevent abuse
@@ -1744,24 +1853,30 @@ function wpf_delete_uploaded_file($request) {
 }
 
 function wpf_run_command_sse($request) {
+    $params = $request->get_json_params();
+    $command = $params['command'] ?? '';
+
+    return wpf_run_command_sse_with_command($command);
+}
+
+function wpf_run_command_sse_with_command($command) {
     // SECURITY: Rate limiting
     if (!wpf_check_rate_limit()) {
         header('Content-Type: application/json');
         echo json_encode(['error' => 'Rate limit exceeded']);
-        return;
+        exit;
     }
-
-    $params = $request->get_json_params();
-    $command = $params['command'] ?? '';
 
     // SECURITY: Validate command input
     if (empty($command) || !is_string($command)) {
         header('Content-Type: application/json');
-        return new WP_Error('empty_command', 'No command provided', ['status' => 400]);
+        echo json_encode(['error' => 'Invalid command']);
+        exit;
     }
     if (!wpf_validate_command($command)) {
         header('Content-Type: application/json');
-        return new WP_Error('invalid_command', 'Invalid or disallowed command', ['status' => 400]);
+        echo json_encode(['error' => 'Invalid command']);
+        exit;
     }
 
     // Set headers for SSE
