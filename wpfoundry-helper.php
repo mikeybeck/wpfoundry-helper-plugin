@@ -2,9 +2,13 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 3.14
+Version: 3.15
 Author: Mikey
 */
+
+define('WPFOUNDRY_HELPER_MIN_APP_VERSION', '1.0.0');
+define('WPFOUNDRY_HELPER_MAX_APP_VERSION', '1.0.0');
+define('WPFOUNDRY_HELPER_PROTOCOL_VERSION', 1);
 
 add_action('rest_api_init', function () {
     register_rest_route('wpfoundry/v1', '/run', [
@@ -418,6 +422,9 @@ class WPFCommandRunner {
             'status' => 'success',
             'version' => $this->wpfoundry_get_this_plugin_version(),
             'slug' => $this->wpfoundry_get_this_plugin_slug_dir(),
+            'min_supported_app' => WPFOUNDRY_HELPER_MIN_APP_VERSION,
+            'max_supported_app' => WPFOUNDRY_HELPER_MAX_APP_VERSION,
+            'protocol_version' => WPFOUNDRY_HELPER_PROTOCOL_VERSION,
         ];
 
         $this->emit_event('command_data', [
