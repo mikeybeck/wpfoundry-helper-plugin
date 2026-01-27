@@ -2,13 +2,14 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 3.15
+Version: 3.16
 Author: Mikey
 */
 
 define('WPFOUNDRY_HELPER_MIN_APP_VERSION', '1.0.0');
 define('WPFOUNDRY_HELPER_MAX_APP_VERSION', '1.0.0');
 define('WPFOUNDRY_HELPER_PROTOCOL_VERSION', 1);
+define('WPFOUNDRY_HELPER_PREVIOUS_SECRET_TTL', 900);
 
 add_action('rest_api_init', function () {
     register_rest_route('wpfoundry/v1', '/run', [
@@ -35,6 +36,13 @@ add_action('rest_api_init', function () {
     register_rest_route('wpfoundry/v1', '/upload-delete', [
         'methods' => 'POST',
         'callback' => 'wpf_delete_uploaded_file',
+        'permission_callback' => 'wpf_verify_hmac_auth',
+    ]);
+
+    // Rotate the shared secret (keeps previous secret valid briefly).
+    register_rest_route('wpfoundry/v1', '/rotate-secret', [
+        'methods' => 'POST',
+        'callback' => 'wpf_rotate_shared_secret',
         'permission_callback' => 'wpf_verify_hmac_auth',
     ]);
 });
@@ -1518,11 +1526,49 @@ function wpf_validate_command($command) {
 
 function wpfoundry_get_shared_secret($force_regenerate = false) {
     $secret = get_option('wpfoundry_shared_secret');
-    if ($force_regenerate || !$secret || !is_string($secret) || strlen($secret) < 32) {
+    if ($force_regenerate) {
+        $secret = wpfoundry_rotate_secret();
+        return $secret;
+    }
+
+    if (!$secret || !is_string($secret) || strlen($secret) < 32) {
         $secret = bin2hex(random_bytes(32));
         update_option('wpfoundry_shared_secret', $secret, false);
     }
     return $secret;
+}
+
+function wpfoundry_get_previous_secret() {
+    $prev = get_option('wpfoundry_prev_shared_secret');
+    $expires = get_option('wpfoundry_prev_shared_secret_expires');
+    if (!$prev || !is_string($prev)) {
+        return '';
+    }
+
+    if (!is_numeric($expires) || time() > intval($expires)) {
+        delete_option('wpfoundry_prev_shared_secret');
+        delete_option('wpfoundry_prev_shared_secret_expires');
+        return '';
+    }
+
+    return $prev;
+}
+
+function wpfoundry_rotate_secret($grace_seconds = WPFOUNDRY_HELPER_PREVIOUS_SECRET_TTL) {
+    $current = get_option('wpfoundry_shared_secret');
+    $new_secret = bin2hex(random_bytes(32));
+
+    if ($current && is_string($current)) {
+        update_option('wpfoundry_prev_shared_secret', $current, false);
+        update_option('wpfoundry_prev_shared_secret_expires', time() + intval($grace_seconds), false);
+    } else {
+        delete_option('wpfoundry_prev_shared_secret');
+        delete_option('wpfoundry_prev_shared_secret_expires');
+    }
+
+    update_option('wpfoundry_shared_secret', $new_secret, false);
+
+    return $new_secret;
 }
 
 function wpfoundry_get_header_value($request, $header_name) {
@@ -1602,28 +1648,34 @@ function wpf_verify_hmac_from_parts($method, $route, $query, $body, $headers) {
     $request_id = wpfoundry_get_header_from_array($headers, 'x-wpf-request-id');
 
     if ($signature === '' || $timestamp === '' || $nonce === '' || $body_hash === '') {
+        wpf_log_auth_event('failure', 'missing_headers', $request_id);
         return new WP_Error('wpf_auth_failed', 'Unauthorized', ['status' => 401]);
     }
 
     if (!preg_match('/^[a-f0-9]{64}$/i', $body_hash)) {
+        wpf_log_auth_event('failure', 'invalid_body_hash', $request_id);
         return new WP_Error('wpf_auth_failed', 'Unauthorized', ['status' => 401]);
     }
 
     if (!preg_match('/^[a-f0-9]{16,128}$/i', $nonce)) {
+        wpf_log_auth_event('failure', 'invalid_nonce', $request_id);
         return new WP_Error('wpf_auth_failed', 'Unauthorized', ['status' => 401]);
     }
 
     $ts_int = intval($timestamp);
     if ($ts_int <= 0 || abs(time() - $ts_int) > 300) {
+        wpf_log_auth_event('failure', 'timestamp_invalid', $request_id);
         return new WP_Error('wpf_auth_failed', 'Unauthorized', ['status' => 401]);
     }
 
     if (wpfoundry_is_nonce_used($nonce)) {
+        wpf_log_auth_event('failure', 'nonce_replay', $request_id);
         return new WP_Error('wpf_auth_failed', 'Unauthorized', ['status' => 401]);
     }
 
     $computed_body_hash = hash('sha256', is_string($body) ? $body : '');
     if (!hash_equals(strtolower($body_hash), strtolower($computed_body_hash))) {
+        wpf_log_auth_event('failure', 'body_hash_mismatch', $request_id);
         return new WP_Error('wpf_auth_failed', 'Unauthorized', ['status' => 401]);
     }
 
@@ -1640,8 +1692,30 @@ function wpf_verify_hmac_from_parts($method, $route, $query, $body, $headers) {
     $secret = wpfoundry_get_shared_secret(false);
     $expected = hash_hmac('sha256', $base_string, $secret);
 
-    if (!hash_equals($expected, strtolower($signature))) {
+    $match = hash_equals($expected, strtolower($signature));
+    $used_secret = '';
+    if ($match) {
+        $used_secret = $secret;
+    }
+    if (!$match) {
+        $previous = wpfoundry_get_previous_secret();
+        if ($previous !== '') {
+            $expected_prev = hash_hmac('sha256', $base_string, $previous);
+            $match = hash_equals($expected_prev, strtolower($signature));
+            if ($match) {
+                $used_secret = $previous;
+            }
+        }
+    }
+
+    if (!$match) {
+        wpf_log_auth_event('failure', 'signature_mismatch', $request_id);
         return new WP_Error('wpf_auth_failed', 'Unauthorized', ['status' => 401]);
+    }
+
+    if ($used_secret !== '' && !wpf_check_rate_limit_for_secret($used_secret)) {
+        wpf_log_auth_event('failure', 'rate_limited_secret', $request_id);
+        return new WP_Error('rate_limited', 'Rate limit exceeded', ['status' => 429]);
     }
 
     wpfoundry_store_nonce($nonce, 600);
@@ -1693,6 +1767,43 @@ function wpf_check_rate_limit() {
     set_transient($key, $data, 60);
 
     return true;
+}
+
+function wpf_check_rate_limit_for_secret($secret) {
+    if (!is_string($secret) || $secret === '') {
+        return true;
+    }
+
+    $key = 'wpf_rate_limit_secret_' . hash('sha256', $secret);
+    $now = time();
+    $data = get_transient($key);
+    if (!$data) {
+        $data = ['count' => 0, 'reset' => $now + 60];
+    }
+
+    if ($now > $data['reset']) {
+        $data = ['count' => 0, 'reset' => $now + 60];
+    }
+
+    if ($data['count'] >= 10) {
+        return false;
+    }
+
+    $data['count']++;
+    set_transient($key, $data, 60);
+    return true;
+}
+
+function wpf_log_auth_event($status, $reason, $request_id = '') {
+    $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+    $entry = [
+        'event' => 'wpf_auth',
+        'status' => $status,
+        'reason' => $reason,
+        'ip' => $ip,
+        'request_id' => $request_id,
+    ];
+    error_log('WPFoundryAuth ' . wp_json_encode($entry));
 }
 
 /**
@@ -1856,6 +1967,22 @@ function wpf_delete_uploaded_file($request) {
     return rest_ensure_response([
         'success' => true,
         'deleted' => true,
+    ]);
+}
+
+function wpf_rotate_shared_secret($request) {
+    if (!wpf_check_rate_limit()) {
+        return new WP_Error('rate_limited', 'Rate limit exceeded', ['status' => 429]);
+    }
+
+    $new_secret = wpfoundry_rotate_secret();
+    $expires = get_option('wpfoundry_prev_shared_secret_expires');
+
+    return rest_ensure_response([
+        'success' => true,
+        'shared_secret' => $new_secret,
+        'previous_expires_at' => is_numeric($expires) ? intval($expires) : null,
+        'grace_seconds' => WPFOUNDRY_HELPER_PREVIOUS_SECRET_TTL,
     ]);
 }
 
