@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 3.17
+Version: 3.18
 Author: Mikey
 */
 
@@ -173,6 +173,16 @@ function wpf_get_local_binaries() {
         return $cached;
     }
 
+    // Manual override (e.g. in wp-config.php) when auto-detection fails
+    if (defined('WP_FOUNDRY_LOCAL_PHP') && defined('WP_FOUNDRY_LOCAL_WP')) {
+        $php_bin = WP_FOUNDRY_LOCAL_PHP;
+        $wp_path = WP_FOUNDRY_LOCAL_WP;
+        if (is_executable($php_bin) && is_readable($wp_path)) {
+            $cached = ['php' => $php_bin, 'wp' => $wp_path];
+            return $cached;
+        }
+    }
+
     $php_bin = null;
     $wp_path = null;
     $lightning_base = null;
@@ -239,6 +249,18 @@ function wpf_get_local_binaries() {
     return null;
 }
 
+function wpf_get_homes_from_abspath() {
+    $homes = [];
+    if (!defined('ABSPATH')) {
+        return $homes;
+    }
+    $abs = wp_normalize_path(ABSPATH);
+    if (preg_match('#^/home/([^/]+)/(?:Local\s+Sites|Sites)/#', $abs, $m)) {
+        $homes[] = '/home/' . $m[1];
+    }
+    return $homes;
+}
+
 function wpf_get_home_dir() {
     $home = getenv('HOME');
     if ($home !== false && $home !== '') {
@@ -248,12 +270,23 @@ function wpf_get_home_dir() {
         $info = posix_getpwuid(posix_geteuid());
         return isset($info['dir']) ? $info['dir'] : '';
     }
+    // Fallback: site owner (when php-fpm runs as different user but script is chowned to site owner)
+    $script_owner = function_exists('posix_getpwuid') && function_exists('fileowner')
+        ? @posix_getpwuid(@fileowner(__FILE__))
+        : null;
+    if (is_array($script_owner) && !empty($script_owner['dir'])) {
+        return $script_owner['dir'];
+    }
     return '';
 }
 
 function wpf_find_lightning_services_base() {
     $home = wpf_get_home_dir();
     $is_windows = (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN');
+
+    // Build list of home dirs to try. When running under php-fpm, process HOME may be wrong
+    // (e.g. www-data). Derive from ABSPATH when it matches /home/username/Local Sites/...
+    $homes_to_try = array_filter(array_unique(array_merge([$home], wpf_get_homes_from_abspath())));
 
     $search_bases = [];
     if ($is_windows) {
@@ -264,10 +297,18 @@ function wpf_find_lightning_services_base() {
         $search_bases[] = 'C:\\Program Files (x86)\\Local\\resources';
         $search_bases[] = 'C:\\Program Files\\Local\\resources';
     } elseif (strtoupper(PHP_OS) === 'DARWIN') {
-        $search_bases[] = $home . '/Library/Application Support/Local';
+        foreach ($homes_to_try as $h) {
+            if ($h !== '') {
+                $search_bases[] = $h . '/Library/Application Support/Local';
+            }
+        }
     } else {
-        $search_bases[] = $home . '/.config/Local';
-        $search_bases[] = $home . '/.local/share/Local';
+        foreach ($homes_to_try as $h) {
+            if ($h !== '') {
+                $search_bases[] = $h . '/.config/Local';
+                $search_bases[] = $h . '/.local/share/Local';
+            }
+        }
         $search_bases[] = '/opt/Local/resources';
     }
 
