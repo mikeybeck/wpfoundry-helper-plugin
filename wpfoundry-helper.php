@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 3.20
+Version: 3.22
 Author: Mikey
 */
 
@@ -173,6 +173,12 @@ function wpf_get_local_binaries() {
         return $cached;
     }
 
+    // Skip Local PHP when it has incompatible deps. Use system wp instead (may fail on Local DB).
+    if (defined('WP_FOUNDRY_USE_SYSTEM_CLI') && WP_FOUNDRY_USE_SYSTEM_CLI) {
+        $cached = null;
+        return null;
+    }
+
     // Manual override (e.g. in wp-config.php) when auto-detection fails
     if (defined('WP_FOUNDRY_LOCAL_PHP') && defined('WP_FOUNDRY_LOCAL_WP')) {
         $php_bin = WP_FOUNDRY_LOCAL_PHP;
@@ -335,20 +341,24 @@ function wpf_find_local_php($lightning_base) {
     $platform = $is_windows ? 'win64' : (strtoupper(PHP_OS) === 'DARWIN' ? 'darwin' : 'linux');
     $php_name = $is_windows ? 'php.exe' : 'php';
 
-    $glob = $lightning_base . DIRECTORY_SEPARATOR . 'php-*' . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . $platform . DIRECTORY_SEPARATOR . $php_name;
-    $matches = glob($glob);
-    if (empty($matches)) {
-        $glob = $lightning_base . DIRECTORY_SEPARATOR . 'php-*' . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . $php_name;
-        $matches = glob($glob);
+    $globs = [
+        $lightning_base . DIRECTORY_SEPARATOR . 'php-*' . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . $platform . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . $php_name,
+        $lightning_base . DIRECTORY_SEPARATOR . 'php-*' . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . $platform . DIRECTORY_SEPARATOR . $php_name,
+        $lightning_base . DIRECTORY_SEPARATOR . 'php-*' . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . $php_name,
+    ];
+    $matches = [];
+    foreach ($globs as $glob) {
+        $matches = array_merge($matches, (array) glob($glob));
     }
-    $matches = array_filter($matches, function ($p) {
-        return strpos($p, 'php-fpm') === false && strpos($p, 'sbin') === false;
+    $matches = array_filter(array_unique($matches), function ($p) {
+        return is_file($p) && strpos($p, 'php-fpm') === false && strpos($p, 'sbin') === false;
     });
     if (empty($matches)) {
         return null;
     }
     usort($matches, 'strnatcasecmp');
-    return (string) end($matches);
+    // Prefer lowest version: PHP 8.4 may have Debian-specific deps (libtidy.so.5deb1) that fail on Arch
+    return (string) reset($matches);
 }
 
 function wpf_find_local_wp_cli($lightning_base) {
