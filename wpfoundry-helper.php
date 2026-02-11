@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 3.18
+Version: 3.19
 Author: Mikey
 */
 
@@ -239,6 +239,10 @@ function wpf_get_local_binaries() {
     if ($wp_path === null) {
         $wp_path = wpf_find_local_wp_cli($lightning_base);
     }
+    if ($wp_path === null && $php_bin !== null) {
+        // Local does not bundle WP-CLI on Linux; use Local's PHP with system wp
+        $wp_path = wpf_find_system_wp_cli();
+    }
 
     if ($php_bin && $wp_path && is_executable($php_bin) && is_readable($wp_path)) {
         $cached = ['php' => $php_bin, 'wp' => $wp_path];
@@ -357,6 +361,32 @@ function wpf_find_local_wp_cli($lightning_base) {
             if (is_readable($path)) {
                 return $path;
             }
+        }
+    }
+    return null;
+}
+
+/**
+ * Find system-installed WP-CLI. Local does not bundle WP-CLI; we use Local's PHP to run the system wp.
+ */
+function wpf_find_system_wp_cli() {
+    $homes = array_filter(array_unique(array_merge(
+        [wpf_get_home_dir()],
+        wpf_get_homes_from_abspath()
+    )));
+    $paths = [
+        '/usr/bin/wp',
+        '/usr/local/bin/wp',
+    ];
+    foreach ($homes as $home) {
+        if ($home !== '') {
+            $paths[] = $home . '/.local/bin/wp';
+            $paths[] = $home . '/bin/wp';
+        }
+    }
+    foreach ($paths as $path) {
+        if (file_exists($path) && is_readable($path)) {
+            return $path;
         }
     }
     return null;
