@@ -1631,11 +1631,11 @@ class WPFCommandRunner {
 
         $invocation = $this->get_wp_cli_invocation();
 
-        // Strip control chars (e.g. \r from JSON) that can corrupt the command
-        $command_clean = preg_replace('/[\x00-\x1F\x7F]/u', '', $command);
+        // Strip control chars and Unicode ignorables that can corrupt the command
+        $command_clean = preg_replace('/[\x00-\x1F\x7F\u200B-\u200D\uFEFF]/u', '', $command);
         $user_part = (strpos($command_clean, 'wp ') === 0) ? substr($command_clean, 4) : $command_clean;
-        $safe_user_part = escapeshellcmd($user_part);
-        $command_to_run = $invocation['command'] . $safe_user_part;
+        // Avoid escapeshellcmd: it can corrupt valid args (e.g. --format=json). Command is validated by wpf_validate_command.
+        $command_to_run = $invocation['command'] . $user_part;
         $env = $invocation['env'];
 
         $process = proc_open($command_to_run . " 2>&1", $descriptorspec, $pipes, ABSPATH, $env);
