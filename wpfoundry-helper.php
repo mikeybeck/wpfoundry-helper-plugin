@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 3.22
+Version: 3.23
 Author: Mikey
 */
 
@@ -1631,7 +1631,9 @@ class WPFCommandRunner {
 
         $invocation = $this->get_wp_cli_invocation();
 
-        $user_part = (strpos($command, 'wp ') === 0) ? substr($command, 4) : $command;
+        // Strip control chars (e.g. \r from JSON) that can corrupt the command
+        $command_clean = preg_replace('/[\x00-\x1F\x7F]/u', '', $command);
+        $user_part = (strpos($command_clean, 'wp ') === 0) ? substr($command_clean, 4) : $command_clean;
         $safe_user_part = escapeshellcmd($user_part);
         $command_to_run = $invocation['command'] . $safe_user_part;
         $env = $invocation['env'];
