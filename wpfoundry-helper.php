@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 3.19
+Version: 3.20
 Author: Mikey
 */
 
@@ -187,16 +187,16 @@ function wpf_get_local_binaries() {
     $wp_path = null;
     $lightning_base = null;
 
-    // Primary: PHP_BINARY under Local/lightning-services
+    // Primary: derive lightning-services base from PHP_BINARY when running under Local
+    // Note: PHP_BINARY often points to php-fpm when serving web requests; we need the CLI php for exec
     if (defined('PHP_BINARY') && PHP_BINARY !== '') {
         $pb = PHP_BINARY;
-        if (strpos($pb, 'Local') !== false || strpos($pb, 'lightning-services') !== false) {
-            if (is_executable($pb)) {
+        if ((strpos($pb, 'Local') !== false || strpos($pb, 'lightning-services') !== false)
+            && preg_match('#(.+[/\\\\]lightning-services)[/\\\\]#', $pb, $m)) {
+            $lightning_base = $m[1];
+            // Only use PHP_BINARY if it's the CLI binary, not php-fpm
+            if (strpos($pb, 'php-fpm') === false && strpos($pb, 'sbin') === false && is_executable($pb)) {
                 $php_bin = $pb;
-                // Derive lightning-services base: e.g. .../lightning-services/php-8.2/bin/linux/php -> .../lightning-services
-                if (preg_match('#(.+[/\\\\]lightning-services)[/\\\\]#', $pb, $m)) {
-                    $lightning_base = $m[1];
-                }
             }
         }
     }
@@ -341,6 +341,9 @@ function wpf_find_local_php($lightning_base) {
         $glob = $lightning_base . DIRECTORY_SEPARATOR . 'php-*' . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . $php_name;
         $matches = glob($glob);
     }
+    $matches = array_filter($matches, function ($p) {
+        return strpos($p, 'php-fpm') === false && strpos($p, 'sbin') === false;
+    });
     if (empty($matches)) {
         return null;
     }
