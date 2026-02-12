@@ -1931,7 +1931,7 @@ function wpf_upload_file($request) {
         return new WP_Error('invalid_file_type', 'Only zip files are supported', ['status' => 400]);
     }
 
-    $base_dir = trailingslashit(sys_get_temp_dir()) . 'wpfoundry-uploads';
+    $base_dir = trailingslashit(WP_CONTENT_DIR) . 'uploads/wpfoundry';
     if (!wp_mkdir_p($base_dir)) {
         return new WP_Error('upload_dir_failed', 'Failed to create upload directory', ['status' => 500]);
     }
@@ -1985,6 +1985,7 @@ function wpf_install_from_upload($request) {
     }
 
     $path = $data['path'];
+    require_once ABSPATH . 'wp-admin/includes/file.php';
     require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
 
     if ($type === 'plugin') {
