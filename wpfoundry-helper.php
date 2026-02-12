@@ -162,249 +162,6 @@ function wpfoundry_handle_custom_endpoint() {
     wpf_run_command_sse_with_command($command);
 }
 
-/**
- * Local by Flywheel detection and binary discovery.
- * Returns ['php' => path, 'wp' => path] when Local is detected, null otherwise.
- * Cached per-request.
- */
-function wpf_get_local_binaries() {
-    static $cached = null;
-    if ($cached !== null) {
-        return $cached;
-    }
-
-    // Skip Local PHP when it has incompatible deps. Use system wp instead (may fail on Local DB).
-    if (defined('WP_FOUNDRY_USE_SYSTEM_CLI') && WP_FOUNDRY_USE_SYSTEM_CLI) {
-        $cached = null;
-        return null;
-    }
-
-    // Manual override (e.g. in wp-config.php) when auto-detection fails
-    if (defined('WP_FOUNDRY_LOCAL_PHP') && defined('WP_FOUNDRY_LOCAL_WP')) {
-        $php_bin = WP_FOUNDRY_LOCAL_PHP;
-        $wp_path = WP_FOUNDRY_LOCAL_WP;
-        if (is_executable($php_bin) && is_readable($wp_path)) {
-            $cached = ['php' => $php_bin, 'wp' => $wp_path];
-            return $cached;
-        }
-    }
-
-    $php_bin = null;
-    $wp_path = null;
-    $lightning_base = null;
-
-    // Primary: derive lightning-services base from PHP_BINARY when running under Local
-    // Note: PHP_BINARY often points to php-fpm when serving web requests; we need the CLI php for exec
-    if (defined('PHP_BINARY') && PHP_BINARY !== '') {
-        $pb = PHP_BINARY;
-        if ((strpos($pb, 'Local') !== false || strpos($pb, 'lightning-services') !== false)
-            && preg_match('#(.+[/\\\\]lightning-services)[/\\\\]#', $pb, $m)) {
-            $lightning_base = $m[1];
-            // Only use PHP_BINARY if it's the CLI binary, not php-fpm
-            if (strpos($pb, 'php-fpm') === false && strpos($pb, 'sbin') === false && is_executable($pb)) {
-                $php_bin = $pb;
-            }
-        }
-    }
-
-    // Secondary: ABSPATH under known Local sites directory
-    if ($lightning_base === null && defined('ABSPATH')) {
-        $abs = wp_normalize_path(ABSPATH);
-        $home = wpf_get_home_dir();
-        $local_markers = [
-            $home . '/Local Sites/',
-            $home . '/Sites/',
-            '/Local Sites/',
-            '/Sites/',
-        ];
-        $is_local_site = false;
-        foreach ($local_markers as $marker) {
-            $marker = wp_normalize_path($marker);
-            if (strpos($abs, $marker) === 0) {
-                $is_local_site = true;
-                break;
-            }
-        }
-        if (!$is_local_site && (strpos($abs, 'Local Sites') !== false || strpos($abs, '/Local/') !== false)) {
-            $is_local_site = true;
-        }
-
-        if ($is_local_site) {
-            $lightning_base = wpf_find_lightning_services_base();
-        }
-    }
-
-    if ($lightning_base === null || !is_dir($lightning_base)) {
-        $cached = null;
-        return null;
-    }
-
-    if ($php_bin === null) {
-        $php_bin = wpf_find_local_php($lightning_base);
-    }
-    if ($wp_path === null) {
-        $wp_path = wpf_find_local_wp_cli($lightning_base);
-    }
-    if ($wp_path === null && $php_bin !== null) {
-        // Local does not bundle WP-CLI on Linux; use Local's PHP with system wp
-        $wp_path = wpf_find_system_wp_cli();
-    }
-
-    if ($php_bin && $wp_path && is_executable($php_bin) && is_readable($wp_path)) {
-        $cached = ['php' => $php_bin, 'wp' => $wp_path];
-        return $cached;
-    }
-
-    $cached = null;
-    return null;
-}
-
-function wpf_get_homes_from_abspath() {
-    $homes = [];
-    if (!defined('ABSPATH')) {
-        return $homes;
-    }
-    $abs = wp_normalize_path(ABSPATH);
-    if (preg_match('#^/home/([^/]+)/(?:Local\s+Sites|Sites)/#', $abs, $m)) {
-        $homes[] = '/home/' . $m[1];
-    }
-    return $homes;
-}
-
-function wpf_get_home_dir() {
-    $home = getenv('HOME');
-    if ($home !== false && $home !== '') {
-        return $home;
-    }
-    if (function_exists('posix_getpwuid') && function_exists('posix_geteuid')) {
-        $info = posix_getpwuid(posix_geteuid());
-        return isset($info['dir']) ? $info['dir'] : '';
-    }
-    // Fallback: site owner (when php-fpm runs as different user but script is chowned to site owner)
-    $script_owner = function_exists('posix_getpwuid') && function_exists('fileowner')
-        ? @posix_getpwuid(@fileowner(__FILE__))
-        : null;
-    if (is_array($script_owner) && !empty($script_owner['dir'])) {
-        return $script_owner['dir'];
-    }
-    return '';
-}
-
-function wpf_find_lightning_services_base() {
-    $home = wpf_get_home_dir();
-    $is_windows = (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN');
-
-    // Build list of home dirs to try. When running under php-fpm, process HOME may be wrong
-    // (e.g. www-data). Derive from ABSPATH when it matches /home/username/Local Sites/...
-    $homes_to_try = array_filter(array_unique(array_merge([$home], wpf_get_homes_from_abspath())));
-
-    $search_bases = [];
-    if ($is_windows) {
-        $appdata = getenv('APPDATA');
-        if ($appdata) {
-            $search_bases[] = $appdata . DIRECTORY_SEPARATOR . 'Local';
-        }
-        $search_bases[] = 'C:\\Program Files (x86)\\Local\\resources';
-        $search_bases[] = 'C:\\Program Files\\Local\\resources';
-    } elseif (strtoupper(PHP_OS) === 'DARWIN') {
-        foreach ($homes_to_try as $h) {
-            if ($h !== '') {
-                $search_bases[] = $h . '/Library/Application Support/Local';
-            }
-        }
-    } else {
-        foreach ($homes_to_try as $h) {
-            if ($h !== '') {
-                $search_bases[] = $h . '/.config/Local';
-                $search_bases[] = $h . '/.local/share/Local';
-            }
-        }
-        $search_bases[] = '/opt/Local/resources';
-    }
-
-    foreach ($search_bases as $base) {
-        $candidate = $base . DIRECTORY_SEPARATOR . 'lightning-services';
-        if (is_dir($candidate)) {
-            return $candidate;
-        }
-        // AppImage / unpacked: resources/extraResources/lightning-services
-        $candidate2 = $base . DIRECTORY_SEPARATOR . 'extraResources' . DIRECTORY_SEPARATOR . 'lightning-services';
-        if (is_dir($candidate2)) {
-            return $candidate2;
-        }
-    }
-    return null;
-}
-
-function wpf_find_local_php($lightning_base) {
-    $is_windows = (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN');
-    $platform = $is_windows ? 'win64' : (strtoupper(PHP_OS) === 'DARWIN' ? 'darwin' : 'linux');
-    $php_name = $is_windows ? 'php.exe' : 'php';
-
-    $globs = [
-        $lightning_base . DIRECTORY_SEPARATOR . 'php-*' . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . $platform . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . $php_name,
-        $lightning_base . DIRECTORY_SEPARATOR . 'php-*' . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . $platform . DIRECTORY_SEPARATOR . $php_name,
-        $lightning_base . DIRECTORY_SEPARATOR . 'php-*' . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . $php_name,
-    ];
-    $matches = [];
-    foreach ($globs as $glob) {
-        $matches = array_merge($matches, (array) glob($glob));
-    }
-    $matches = array_filter(array_unique($matches), function ($p) {
-        return is_file($p) && strpos($p, 'php-fpm') === false && strpos($p, 'sbin') === false;
-    });
-    if (empty($matches)) {
-        return null;
-    }
-    usort($matches, 'strnatcasecmp');
-    // Prefer lowest version: PHP 8.4 may have Debian-specific deps (libtidy.so.5deb1) that fail on Arch
-    return (string) reset($matches);
-}
-
-function wpf_find_local_wp_cli($lightning_base) {
-    $candidates = [
-        $lightning_base . DIRECTORY_SEPARATOR . 'wp-cli-*' . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . 'wp',
-        $lightning_base . DIRECTORY_SEPARATOR . 'wp-cli-*' . DIRECTORY_SEPARATOR . 'wp',
-    ];
-    foreach ($candidates as $glob) {
-        $matches = glob($glob);
-        if (!empty($matches)) {
-            usort($matches, 'strnatcasecmp');
-            $path = (string) end($matches);
-            if (is_readable($path)) {
-                return $path;
-            }
-        }
-    }
-    return null;
-}
-
-/**
- * Find system-installed WP-CLI. Local does not bundle WP-CLI; we use Local's PHP to run the system wp.
- */
-function wpf_find_system_wp_cli() {
-    $homes = array_filter(array_unique(array_merge(
-        [wpf_get_home_dir()],
-        wpf_get_homes_from_abspath()
-    )));
-    $paths = [
-        '/usr/bin/wp',
-        '/usr/local/bin/wp',
-    ];
-    foreach ($homes as $home) {
-        if ($home !== '') {
-            $paths[] = $home . '/.local/bin/wp';
-            $paths[] = $home . '/bin/wp';
-        }
-    }
-    foreach ($paths as $path) {
-        if (file_exists($path) && is_readable($path)) {
-            return $path;
-        }
-    }
-    return null;
-}
-
 class WPFCommandRunner {
 
     private function emit_event($type, $data = []) {
@@ -416,34 +173,6 @@ class WPFCommandRunner {
         echo "event: $type\n";
         echo "data: " . json_encode($event) . "\n\n";
         @ob_flush(); @flush();
-    }
-
-    /**
-     * Returns the shell command prefix and env for WP-CLI execution.
-     * When Local by Flywheel is detected, uses Local's PHP + WP-CLI.
-     *
-     * @return array{command: string, env: array} command prefix (subcommand should be appended) and env
-     */
-    private function get_wp_cli_invocation() {
-        $env = $_ENV;
-        $env['WP_CLI_CACHE_DIR'] = sys_get_temp_dir() . '/wp-cli-cache';
-
-        $local = wpf_get_local_binaries();
-        if ($local !== null) {
-            $php_bin = escapeshellarg($local['php']);
-            $wp_path = escapeshellarg($local['wp']);
-            $path_arg = escapeshellarg(ABSPATH);
-            $prefix = $php_bin . ' ' . $wp_path . ' --path=' . $path_arg . ' ';
-            return [
-                'command' => $prefix,
-                'env' => $env,
-            ];
-        }
-
-        return [
-            'command' => 'wp ',
-            'env' => $env,
-        ];
     }
 
     private function execute_wpfoundry_command($command) {
@@ -1204,9 +933,9 @@ class WPFCommandRunner {
                 2 => ['pipe', 'w'], // stderr
             ];
 
-            $invocation = $this->get_wp_cli_invocation();
-            $command_to_run = $invocation['command'] . 'db export ' . escapeshellarg($tmp_sql);
-            $env = $invocation['env'];
+            $command_to_run = 'wp db export ' . escapeshellarg($tmp_sql);
+            $env = $_ENV;
+            $env['WP_CLI_CACHE_DIR'] = sys_get_temp_dir() . '/wp-cli-cache';
 
             $process = proc_open($command_to_run . " 2>&1", $descriptorspec, $pipes, ABSPATH, $env);
             if (!is_resource($process)) {
@@ -1629,16 +1358,16 @@ class WPFCommandRunner {
             2 => ['pipe', 'w'], // stderr
         ];
 
-        $invocation = $this->get_wp_cli_invocation();
+        // SECURITY: Sanitize command for shell execution
+        // Don't add 'wp' prefix if command already starts with 'wp'
+        $command_to_run = (strpos($command, 'wp ') === 0) ? $command : "wp $command";
+        $safe_command = escapeshellcmd($command_to_run);
 
-        // Strip control chars and Unicode ignorables that can corrupt the command
-        $command_clean = preg_replace('/[\x00-\x1F\x7F\u200B-\u200D\uFEFF]/u', '', $command);
-        $user_part = (strpos($command_clean, 'wp ') === 0) ? substr($command_clean, 4) : $command_clean;
-        // Avoid escapeshellcmd: it can corrupt valid args (e.g. --format=json). Command is validated by wpf_validate_command.
-        $command_to_run = $invocation['command'] . $user_part;
-        $env = $invocation['env'];
+        // Set WP-CLI cache dir to a writable location
+        $env = $_ENV;
+        $env['WP_CLI_CACHE_DIR'] = sys_get_temp_dir() . '/wp-cli-cache';
 
-        $process = proc_open($command_to_run . " 2>&1", $descriptorspec, $pipes, ABSPATH, $env);
+        $process = proc_open($safe_command . " 2>&1", $descriptorspec, $pipes, ABSPATH, $env);
         if (!is_resource($process)) {
             $this->emit_event('command_error', [
                 'error' => 'failed_to_start',
