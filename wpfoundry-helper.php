@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 3.30
+Version: 3.31
 Author: Mikey
 */
 
@@ -1965,6 +1965,17 @@ function wpf_upload_file($request) {
 }
 
 /**
+ * Filter callbacks: force direct filesystem when installing from upload via REST.
+ * Prevents FTP credential prompt and ensures direct write in non-admin context.
+ */
+function wpf_install_from_upload_filesystem_method($method) {
+    return 'direct';
+}
+function wpf_install_from_upload_filesystem_credentials($credentials, $form_post, $type) {
+    return true;
+}
+
+/**
  * Install plugin or theme from an uploaded zip (by token).
  * Uses WordPress Plugin_Upgrader/Theme_Upgrader directly instead of WP-CLI.
  */
@@ -1989,12 +2000,21 @@ function wpf_install_from_upload($request) {
     require_once ABSPATH . 'wp-admin/includes/file.php';
     require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
 
-    if ($type === 'plugin') {
-        $upgrader = new Plugin_Upgrader(new WP_Ajax_Upgrader_Skin());
-        $result = $upgrader->install($path, ['overwrite_package' => true]);
-    } else {
-        $upgrader = new Theme_Upgrader(new WP_Ajax_Upgrader_Skin());
-        $result = $upgrader->install($path, ['overwrite_package' => true]);
+    // Force direct filesystem in REST context (no FTP prompt).
+    add_filter('filesystem_method', 'wpf_install_from_upload_filesystem_method', 10, 1);
+    add_filter('request_filesystem_credentials', 'wpf_install_from_upload_filesystem_credentials', 10, 3);
+    $result = null;
+    try {
+        if ($type === 'plugin') {
+            $upgrader = new Plugin_Upgrader(new WP_Ajax_Upgrader_Skin());
+            $result = $upgrader->install($path, ['overwrite_package' => true]);
+        } else {
+            $upgrader = new Theme_Upgrader(new WP_Ajax_Upgrader_Skin());
+            $result = $upgrader->install($path, ['overwrite_package' => true]);
+        }
+    } finally {
+        remove_filter('filesystem_method', 'wpf_install_from_upload_filesystem_method', 10);
+        remove_filter('request_filesystem_credentials', 'wpf_install_from_upload_filesystem_credentials', 10);
     }
 
     if (is_wp_error($result)) {
