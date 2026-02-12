@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 3.25
+Version: 3.26
 Author: Mikey
 */
 
@@ -822,8 +822,14 @@ class WPFCommandRunner {
                 $source_path = $plugin_path;
             } elseif (is_file($content_dropin_path)) {
                 $source_path = $content_dropin_path;
+            } elseif (substr($slug, -4) !== '.php' && is_file($plugin_path . '.php')) {
+                // Single-file plugin: WP-CLI returns "hello" but file is hello.php
+                $source_path = $plugin_path . '.php';
+            } elseif (substr($slug, -4) !== '.php' && is_file($content_dropin_path . '.php')) {
+                // Single-file drop-in in wp-content (e.g. object-cache.php)
+                $source_path = $content_dropin_path . '.php';
             } else {
-                throw new Exception("Plugin directory does not exist: $plugin_path");
+                throw new Exception("Plugin not found: $plugin_path (and not found as single-file $plugin_path.php)");
             }
 
             $result = $this->wpfoundry_create_backup_zip_and_token($source_path, $slug, 'plugin');
