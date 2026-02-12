@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 3.28
+Version: 3.29
 Author: Mikey
 */
 
@@ -1254,9 +1254,10 @@ class WPFCommandRunner {
                 throw new Exception('Failed to create zip (code ' . $opened . ')');
             }
 
+            // WordPress expects plugin/theme zips to have a root folder (slug).
             if (is_file($base_dir)) {
-                // Single-file plugin/drop-in: put file at zip root.
-                $zip->addFile($base_dir, basename($base_dir));
+                // Single-file plugin/drop-in: put in slug folder.
+                $zip->addFile($base_dir, $slug . '/' . basename($base_dir));
             } else {
                 $base_norm = rtrim(str_replace('\\', '/', $base_dir), '/');
                 $iterator = new RecursiveIteratorIterator(
@@ -1276,9 +1277,9 @@ class WPFCommandRunner {
                     }
 
                     $rel = ltrim(substr($pathname, strlen($base_norm)), '/');
-                    // Put plugin/theme files at zip root (no extra top-level directory).
+                    // Put plugin/theme files inside slug folder for valid WordPress zip structure.
                     if ($rel !== '') {
-                        $zip->addFile($file_info->getPathname(), $rel);
+                        $zip->addFile($file_info->getPathname(), $slug . '/' . $rel);
                     }
                 }
             }
@@ -1299,16 +1300,16 @@ class WPFCommandRunner {
 
             $archive = new PclZip($zip_path);
             if (is_file($base_dir)) {
-                // Single-file plugin/drop-in: put file at zip root.
+                // Single-file plugin/drop-in: put in slug folder.
                 $base_remove = dirname($base_dir);
-                $result = $archive->create($base_dir, PCLZIP_OPT_REMOVE_PATH, $base_remove);
+                $result = $archive->create($base_dir, PCLZIP_OPT_REMOVE_PATH, $base_remove, PCLZIP_OPT_ADD_PATH, $slug);
                 if ($result == 0) {
                     throw new Exception('PclZip failed to add file: ' . $archive->errorInfo(true));
                 }
             } else {
-                // Directory plugin/theme: put contents at zip root.
+                // Directory plugin/theme: put contents inside slug folder.
                 $base_remove = rtrim($base_dir, '/\\');
-                $result = $archive->create($base_dir, PCLZIP_OPT_REMOVE_PATH, $base_remove);
+                $result = $archive->create($base_dir, PCLZIP_OPT_REMOVE_PATH, $base_remove, PCLZIP_OPT_ADD_PATH, $slug);
                 if ($result == 0) {
                     throw new Exception('PclZip failed to add files: ' . $archive->errorInfo(true));
                 }
