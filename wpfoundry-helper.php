@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 3.26
+Version: 3.27
 Author: Mikey
 */
 
@@ -36,6 +36,14 @@ add_action('rest_api_init', function () {
     register_rest_route('wpfoundry/v1', '/upload-delete', [
         'methods' => 'POST',
         'callback' => 'wpf_delete_uploaded_file',
+        'permission_callback' => 'wpf_verify_hmac_auth',
+    ]);
+
+    // Install plugin or theme from an uploaded zip (by token). Uses WordPress upgrader directly
+    // instead of WP-CLI to avoid path/escaping issues.
+    register_rest_route('wpfoundry/v1', '/install-from-upload', [
+        'methods' => 'POST',
+        'callback' => 'wpf_install_from_upload',
         'permission_callback' => 'wpf_verify_hmac_auth',
     ]);
 
@@ -1952,6 +1960,51 @@ function wpf_upload_file($request) {
         'filename' => $safe_name,
         'size' => $payload['size'],
         'expires_in' => 600,
+    ]);
+}
+
+/**
+ * Install plugin or theme from an uploaded zip (by token).
+ * Uses WordPress Plugin_Upgrader/Theme_Upgrader directly instead of WP-CLI.
+ */
+function wpf_install_from_upload($request) {
+    $params = $request->get_json_params();
+    $token = $params['token'] ?? '';
+    $type = isset($params['type']) ? strtolower(trim($params['type'])) : 'plugin';
+
+    if (!$token || !is_string($token) || !preg_match('/^[a-f0-9]{32}$/', $token)) {
+        return new WP_Error('invalid_token', 'Missing or invalid token', ['status' => 400]);
+    }
+    if (!in_array($type, ['plugin', 'theme'], true)) {
+        return new WP_Error('invalid_type', 'Type must be plugin or theme', ['status' => 400]);
+    }
+
+    $data = get_transient('wpf_upload_' . $token);
+    if (!is_array($data) || empty($data['path']) || !file_exists($data['path'])) {
+        return new WP_Error('token_not_found', 'Upload token not found or expired', ['status' => 404]);
+    }
+
+    $path = $data['path'];
+    require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+
+    if ($type === 'plugin') {
+        $upgrader = new Plugin_Upgrader(new WP_Ajax_Upgrader_Skin());
+        $result = $upgrader->install($path, ['overwrite_package' => true]);
+    } else {
+        $upgrader = new Theme_Upgrader(new WP_Ajax_Upgrader_Skin());
+        $result = $upgrader->install($path, ['overwrite_package' => true]);
+    }
+
+    if (is_wp_error($result)) {
+        return new WP_Error('install_failed', $result->get_error_message(), ['status' => 500]);
+    }
+    if (!$result) {
+        return new WP_Error('install_failed', 'Installation failed', ['status' => 500]);
+    }
+
+    return rest_ensure_response([
+        'success' => true,
+        'message' => ucfirst($type) . ' installed successfully',
     ]);
 }
 
