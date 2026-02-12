@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 3.29
+Version: 3.30
 Author: Mikey
 */
 
@@ -464,11 +464,11 @@ class WPFCommandRunner {
             'start_time' => microtime(true)
         ]);
 
-        $zip_url = isset($args[0]) ? $args[0] : '';
-        if (!$zip_url) {
+        $zip_url = isset($args[0]) ? trim((string) $args[0]) : '';
+        if (!$zip_url || !filter_var($zip_url, FILTER_VALIDATE_URL)) {
             $this->emit_event('command_error', [
                 'error' => 'missing_zip_url',
-                'message' => 'Missing zip URL argument',
+                'message' => 'Missing or invalid zip URL argument',
                 'exit_code' => 1,
                 'status' => 'error'
             ]);
@@ -525,11 +525,11 @@ class WPFCommandRunner {
             'start_time' => microtime(true)
         ]);
 
-        $zip_url = isset($args[0]) ? $args[0] : '';
-        if (!$zip_url) {
+        $zip_url = isset($args[0]) ? trim((string) $args[0]) : '';
+        if (!$zip_url || !filter_var($zip_url, FILTER_VALIDATE_URL)) {
             $this->emit_event('command_error', [
                 'error' => 'missing_zip_url',
-                'message' => 'Missing zip URL argument',
+                'message' => 'Missing or invalid zip URL argument',
                 'exit_code' => 1,
                 'status' => 'error'
             ]);
