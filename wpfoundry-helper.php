@@ -1715,7 +1715,7 @@ function wpf_verify_hmac_from_parts($method, $route, $query, $body, $headers) {
 
     if ($used_secret !== '' && !wpf_check_rate_limit_for_secret($used_secret)) {
         wpf_log_auth_event('failure', 'rate_limited_secret', $request_id);
-        return new WP_Error('rate_limited', 'Rate limit exceeded', ['status' => 429]);
+        return new WP_Error('rate_limited', 'WPF Rate limit exceeded for site', ['status' => 429]);
     }
 
     wpfoundry_store_nonce($nonce, 600);
@@ -1757,8 +1757,8 @@ function wpf_check_rate_limit() {
         $data = ['count' => 0, 'reset' => $now + 60];
     }
 
-    // Check rate limit (max 10 requests per minute)
-    if ($data['count'] >= 10) {
+    // Check rate limit (max 30 requests per minute)
+    if ($data['count'] >= 30) {
         return false;
     }
 
@@ -1785,7 +1785,7 @@ function wpf_check_rate_limit_for_secret($secret) {
         $data = ['count' => 0, 'reset' => $now + 60];
     }
 
-    if ($data['count'] >= 10) {
+    if ($data['count'] >= 30) {
         return false;
     }
 
@@ -1972,7 +1972,7 @@ function wpf_delete_uploaded_file($request) {
 
 function wpf_rotate_shared_secret($request) {
     if (!wpf_check_rate_limit()) {
-        return new WP_Error('rate_limited', 'Rate limit exceeded', ['status' => 429]);
+        return new WP_Error('rate_limited', 'WPF Rate limit exceeded for site', ['status' => 429]);
     }
 
     $new_secret = wpfoundry_rotate_secret();
@@ -1997,7 +1997,7 @@ function wpf_run_command_sse_with_command($command) {
     // SECURITY: Rate limiting
     if (!wpf_check_rate_limit()) {
         header('Content-Type: application/json');
-        echo json_encode(['error' => 'Rate limit exceeded']);
+        echo json_encode(['error' => 'WPF Rate limit exceeded for site']);
         exit;
     }
 
