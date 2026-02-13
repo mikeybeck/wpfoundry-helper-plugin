@@ -233,6 +233,12 @@ class WPFCommandRunner {
             case 'list-files':
                 $this->wpfoundry_list_files($args);
                 break;
+            case 'plugin-install-from-upload':
+                $this->wpfoundry_plugin_theme_install_from_upload($args, 'plugin');
+                break;
+            case 'theme-install-from-upload':
+                $this->wpfoundry_plugin_theme_install_from_upload($args, 'theme');
+                break;
             default:
                 $this->emit_event('command_error', [
                     'error' => 'unknown_subcommand',
@@ -636,6 +642,88 @@ class WPFCommandRunner {
                 'status' => 'error'
             ]);
         }
+    }
+
+    /**
+     * Install plugin or theme from uploaded zip via WP-CLI.
+     * Token is from wpf_upload_* transient (set by upload endpoint).
+     */
+    private function wpfoundry_plugin_theme_install_from_upload($args, $type) {
+        $subcmd = $type === 'plugin' ? 'plugin-install-from-upload' : 'theme-install-from-upload';
+        $this->emit_event('command_start', [
+            'command' => 'wpfoundry ' . $subcmd . ' ' . implode(' ', $args),
+            'wp_command' => 'wpfoundry',
+            'start_time' => microtime(true)
+        ]);
+
+        $token = isset($args[0]) ? trim((string) $args[0]) : '';
+        if (!$token || !preg_match('/^[a-f0-9]{32}$/', $token)) {
+            $this->emit_event('command_error', [
+                'error' => 'invalid_token',
+                'message' => 'Missing or invalid upload token',
+                'exit_code' => 1,
+                'status' => 'error'
+            ]);
+            return;
+        }
+
+        $data = get_transient('wpf_upload_' . $token);
+        if (!is_array($data) || empty($data['path']) || !file_exists($data['path'])) {
+            $this->emit_event('command_error', [
+                'error' => 'token_not_found',
+                'message' => 'Upload token not found or file no longer exists',
+                'exit_code' => 1,
+                'status' => 'error'
+            ]);
+            return;
+        }
+
+        $path = $data['path'];
+        $wp_cmd = $type === 'plugin' ? 'plugin install' : 'theme install';
+        $full_cmd = "wp {$wp_cmd} " . escapeshellarg($path) . ' --force';
+        $env = $_ENV;
+        $env['WP_CLI_CACHE_DIR'] = sys_get_temp_dir() . '/wp-cli-cache';
+
+        $descriptorspec = [1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+        $process = proc_open($full_cmd . ' 2>&1', $descriptorspec, $pipes, ABSPATH, $env);
+        if (!is_resource($process)) {
+            $this->emit_event('command_error', [
+                'error' => 'proc_open_failed',
+                'message' => 'Failed to run WP-CLI install command',
+                'exit_code' => 1,
+                'status' => 'error'
+            ]);
+            return;
+        }
+
+        $output = stream_get_contents($pipes[1]);
+        $stderr = stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $exit_code = proc_close($process);
+
+        if ($exit_code !== 0) {
+            $msg = trim($stderr ?: $output ?: 'Installation failed');
+            $this->emit_event('command_error', [
+                'error' => 'install_failed',
+                'message' => $msg,
+                'exit_code' => $exit_code,
+                'status' => 'error'
+            ]);
+            return;
+        }
+
+        $this->emit_event('command_data', [
+            'data' => [['status' => 'success', 'type' => $type, 'path' => $path]],
+            'line_number' => 1,
+            'raw_line' => json_encode(['status' => 'success', 'type' => $type])
+        ]);
+        $this->emit_event('command_complete', [
+            'exit_code' => 0,
+            'status' => 'success',
+            'total_lines' => 1,
+            'end_time' => microtime(true)
+        ]);
     }
 
     private function parse_list_files_args($args) {
