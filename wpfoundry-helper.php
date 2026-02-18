@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 3.32
+Version: 3.33
 Author: Mikey
 */
 
@@ -1184,7 +1184,7 @@ class WPFCommandRunner {
                     if ($file_info->isDir()) {
                         $zip->addEmptyDir($zip_entry);
                         $processed++;
-                        if (microtime(true) - $last_emit > 2) {
+                        if (microtime(true) - $last_emit > 1) {
                             $this->emit_event('command_progress', [
                                 'lines_processed' => $processed,
                                 'elapsed_time' => microtime(true) - $start_time
@@ -1196,7 +1196,7 @@ class WPFCommandRunner {
 
                     $zip->addFile($file_path, $zip_entry);
                     $processed++;
-                    if (microtime(true) - $last_emit > 2) {
+                    if (microtime(true) - $last_emit > 1) {
                         $this->emit_event('command_progress', [
                             'lines_processed' => $processed,
                             'elapsed_time' => microtime(true) - $start_time
@@ -1205,6 +1205,10 @@ class WPFCommandRunner {
                     }
                 }
 
+                $this->emit_event('command_progress', [
+                    'lines_processed' => $processed,
+                    'elapsed_time' => microtime(true) - $start_time
+                ]);
                 $zip->close();
             } else {
                 if (!class_exists('PclZip')) {
@@ -1244,7 +1248,7 @@ class WPFCommandRunner {
 
                     $file_list[] = $file_info->getPathname();
                     $processed++;
-                    if (microtime(true) - $last_emit > 2) {
+                    if (microtime(true) - $last_emit > 1) {
                         $this->emit_event('command_progress', [
                             'lines_processed' => $processed,
                             'elapsed_time' => microtime(true) - $start_time
@@ -1253,6 +1257,10 @@ class WPFCommandRunner {
                     }
                 }
 
+                $this->emit_event('command_progress', [
+                    'lines_processed' => $processed,
+                    'elapsed_time' => microtime(true) - $start_time
+                ]);
                 $archive = new PclZip($zip_path);
                 $result = $archive->create(
                     $file_list,
