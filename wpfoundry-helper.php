@@ -9,6 +9,8 @@ Author: Mikey
 define('WPFOUNDRY_HELPER_MIN_APP_VERSION', '2.0.0');
 define('WPFOUNDRY_HELPER_MAX_APP_VERSION', '2.0.0');
 define('WPFOUNDRY_HELPER_PROTOCOL_VERSION', 1);
+define('WPFOUNDRY_HELPER_PROTOCOL_MIN', 1);
+define('WPFOUNDRY_HELPER_PROTOCOL_MAX', 1);
 define('WPFOUNDRY_HELPER_PREVIOUS_SECRET_TTL', 900);
 
 add_action('rest_api_init', function () {
@@ -447,6 +449,16 @@ class WPFCommandRunner {
             'min_supported_app' => WPFOUNDRY_HELPER_MIN_APP_VERSION,
             'max_supported_app' => WPFOUNDRY_HELPER_MAX_APP_VERSION,
             'protocol_version' => WPFOUNDRY_HELPER_PROTOCOL_VERSION,
+            'protocol_min' => WPFOUNDRY_HELPER_PROTOCOL_MIN,
+            'protocol_max' => WPFOUNDRY_HELPER_PROTOCOL_MAX,
+            'capabilities' => [
+                'run',
+                'download',
+                'upload',
+                'upload_delete',
+                'install_from_upload',
+                'rotate_secret',
+            ],
         ];
 
         $this->emit_event('command_data', [
