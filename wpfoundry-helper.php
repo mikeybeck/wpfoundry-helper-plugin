@@ -2,12 +2,12 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 4.0.0
+Version: 4.0.1
 Author: Mikey
 */
 
 define('WPFOUNDRY_HELPER_MIN_APP_VERSION', '2.0.0');
-define('WPFOUNDRY_HELPER_MAX_APP_VERSION', '2.0.0');
+define('WPFOUNDRY_HELPER_MAX_APP_VERSION', '2.99.99');
 define('WPFOUNDRY_HELPER_PROTOCOL_VERSION', 1);
 define('WPFOUNDRY_HELPER_PROTOCOL_MIN', 1);
 define('WPFOUNDRY_HELPER_PROTOCOL_MAX', 1);
