@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 4.0.1
+Version: 4.0.2
 Author: Mikey
 */
 
@@ -1464,6 +1464,8 @@ class WPFCommandRunner {
             return $this->execute_wpfoundry_command($command);
         }
 
+        $start_time = microtime(true);
+
         // Parse command to extract structured info
         $command_parts = explode(' ', trim($command));
         $wp_command = $command_parts[0] ?? $command;
@@ -1472,13 +1474,14 @@ class WPFCommandRunner {
         $this->emit_event('command_start', [
             'command' => $command,
             'wp_command' => $wp_command,
-            'start_time' => microtime(true)
+            'start_time' => $start_time
         ]);
 
-        // Execute WP-CLI command
+        // Redirect the child's stderr into stdout inside the shell so we only
+        // need a single pipe. Allocating a pipe for fd 2 and never reading it
+        // risks deadlock if the child writes enough stderr to fill the pipe buffer.
         $descriptorspec = [
-            1 => ['pipe', 'w'], // stdout
-            2 => ['pipe', 'w'], // stderr
+            1 => ['pipe', 'w'], // stdout (also receives stderr via 2>&1)
         ];
 
         // SECURITY: Sanitize command for shell execution
@@ -1486,8 +1489,17 @@ class WPFCommandRunner {
         $command_to_run = (strpos($command, 'wp ') === 0) ? $command : "wp $command";
         $safe_command = escapeshellcmd($command_to_run);
 
-        // Set WP-CLI cache dir to a writable location
-        $env = $_ENV;
+        // Build env deliberately. $_ENV can be empty on hosts where
+        // variables_order omits "E"; fall back to getenv() for essentials.
+        $env = is_array($_ENV) ? $_ENV : [];
+        foreach (['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TMPDIR'] as $env_key) {
+            if (!isset($env[$env_key])) {
+                $env_value = getenv($env_key);
+                if ($env_value !== false && $env_value !== '') {
+                    $env[$env_key] = $env_value;
+                }
+            }
+        }
         $env['WP_CLI_CACHE_DIR'] = sys_get_temp_dir() . '/wp-cli-cache';
 
         $process = proc_open($safe_command . " 2>&1", $descriptorspec, $pipes, ABSPATH, $env);
@@ -1503,7 +1515,7 @@ class WPFCommandRunner {
         // Stream output with progress tracking
         $reader = $pipes[1];
         $output_lines = 0;
-        $last_output_time = microtime(true);
+        $last_output_time = $start_time;
 
         while (!feof($reader)) {
             $line = fgets($reader);
@@ -1541,7 +1553,7 @@ class WPFCommandRunner {
                 if ($output_lines % 10 === 0 || ($current_time - $last_output_time) > 2) {
                     $this->emit_event('command_progress', [
                         'lines_processed' => $output_lines,
-                        'elapsed_time' => $current_time - microtime(true) + ($output_lines * 0.1) // rough estimate
+                        'elapsed_time' => $current_time - $start_time
                     ]);
                     $last_output_time = $current_time;
                 }
@@ -2185,6 +2197,7 @@ function wpf_run_command_sse($request) {
 function wpf_run_command_sse_with_command($command) {
     // SECURITY: Rate limiting
     if (!wpf_check_rate_limit()) {
+        status_header(429);
         header('Content-Type: application/json');
         echo json_encode(['error' => 'WPF Rate limit exceeded for site']);
         exit;
@@ -2192,11 +2205,13 @@ function wpf_run_command_sse_with_command($command) {
 
     // SECURITY: Validate command input
     if (empty($command) || !is_string($command)) {
+        status_header(400);
         header('Content-Type: application/json');
         echo json_encode(['error' => 'Invalid command']);
         exit;
     }
     if (!wpf_validate_command($command)) {
+        status_header(400);
         header('Content-Type: application/json');
         echo json_encode(['error' => 'Invalid command']);
         exit;
