@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 4.0.2
+Version: 4.0.3
 Author: Mikey
 */
 
@@ -63,6 +63,29 @@ add_action('template_redirect', 'wpfoundry_handle_custom_endpoint');
 register_activation_hook(__FILE__, 'wpfoundry_helper_activate');
 add_action('admin_menu', 'wpfoundry_register_settings_page');
 
+/**
+ * Build a deliberate environment array for proc_open() calls.
+ *
+ * On hosts where PHP's variables_order omits "E", $_ENV is empty and passing
+ * it straight to proc_open leaves the child with no PATH/HOME/etc — wp-cli
+ * then fails with confusing "php: command not found" style errors. Fall back
+ * to getenv() for the common essentials so WP-CLI can find PHP and cache
+ * directories.
+ */
+function wpfoundry_build_cli_env() {
+    $env = is_array($_ENV) ? $_ENV : [];
+    foreach (['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TMPDIR'] as $env_key) {
+        if (!isset($env[$env_key]) || $env[$env_key] === '') {
+            $env_value = getenv($env_key);
+            if ($env_value !== false && $env_value !== '') {
+                $env[$env_key] = $env_value;
+            }
+        }
+    }
+    $env['WP_CLI_CACHE_DIR'] = sys_get_temp_dir() . '/wp-cli-cache';
+    return $env;
+}
+
 function wpfoundry_helper_activate() {
     wpfoundry_get_shared_secret(true);
     wpfoundry_register_rewrite();
@@ -103,8 +126,31 @@ function wpfoundry_render_settings_page() {
             <tr>
                 <th scope="row">Shared secret</th>
                 <td>
-                    <input type="text" class="regular-text" readonly value="<?php echo esc_attr($secret); ?>" />
-                    <p class="description">Keep this secret private. Regenerating will revoke existing access.</p>
+                    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                        <input
+                            type="password"
+                            id="wpfoundry-shared-secret"
+                            class="regular-text code"
+                            readonly
+                            autocomplete="off"
+                            spellcheck="false"
+                            value="<?php echo esc_attr($secret); ?>"
+                            aria-describedby="wpfoundry-shared-secret-desc"
+                        />
+                        <button
+                            type="button"
+                            class="button button-secondary"
+                            onclick="(function(btn){var i=document.getElementById('wpfoundry-shared-secret');var shown=i.type==='text';i.type=shown?'password':'text';btn.textContent=shown?'Show':'Hide';})(this)"
+                        >Show</button>
+                        <button
+                            type="button"
+                            class="button button-secondary"
+                            onclick="(function(btn){var i=document.getElementById('wpfoundry-shared-secret');i.type='text';i.select();try{document.execCommand('copy');btn.textContent='Copied';setTimeout(function(){btn.textContent='Copy';i.type='password';},1500);}catch(e){btn.textContent='Copy failed';}})(this)"
+                        >Copy</button>
+                    </div>
+                    <p id="wpfoundry-shared-secret-desc" class="description">
+                        Keep this secret private. It is hidden by default to prevent screenshots and screen-share leaks. Regenerating will revoke existing access.
+                    </p>
                 </td>
             </tr>
         </table>
@@ -693,10 +739,11 @@ class WPFCommandRunner {
         $path = $data['path'];
         $wp_cmd = $type === 'plugin' ? 'plugin install' : 'theme install';
         $full_cmd = "wp {$wp_cmd} " . escapeshellarg($path) . ' --force';
-        $env = $_ENV;
-        $env['WP_CLI_CACHE_DIR'] = sys_get_temp_dir() . '/wp-cli-cache';
+        $env = wpfoundry_build_cli_env();
 
-        $descriptorspec = [1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+        // Only open the stdout pipe; stderr is merged in via "2>&1" so an
+        // unread stderr pipe cannot deadlock the child.
+        $descriptorspec = [1 => ['pipe', 'w']];
         $process = proc_open($full_cmd . ' 2>&1', $descriptorspec, $pipes, ABSPATH, $env);
         if (!is_resource($process)) {
             $this->emit_event('command_error', [
@@ -708,14 +755,14 @@ class WPFCommandRunner {
             return;
         }
 
+        // stderr is merged into stdout via "2>&1" above, so we only have
+        // $pipes[1] to read.
         $output = stream_get_contents($pipes[1]);
-        $stderr = stream_get_contents($pipes[2]);
         fclose($pipes[1]);
-        fclose($pipes[2]);
         $exit_code = proc_close($process);
 
         if ($exit_code !== 0) {
-            $msg = trim($stderr ?: $output ?: 'Installation failed');
+            $msg = trim($output ?: 'Installation failed');
             $this->emit_event('command_error', [
                 'error' => 'install_failed',
                 'message' => $msg,
@@ -1041,15 +1088,15 @@ class WPFCommandRunner {
         $tmp_sql = trailingslashit(sys_get_temp_dir()) . 'wpfoundry-db-' . uniqid('', true) . '.sql';
 
         try {
-            // Export DB to a temporary SQL file.
+            // Export DB to a temporary SQL file. stderr is merged into stdout
+            // via "2>&1" so we only allocate the stdout pipe — an unread
+            // stderr pipe could otherwise deadlock the child on verbose output.
             $descriptorspec = [
-                1 => ['pipe', 'w'], // stdout
-                2 => ['pipe', 'w'], // stderr
+                1 => ['pipe', 'w'], // stdout (also receives stderr via 2>&1)
             ];
 
             $command_to_run = 'wp db export ' . escapeshellarg($tmp_sql);
-            $env = $_ENV;
-            $env['WP_CLI_CACHE_DIR'] = sys_get_temp_dir() . '/wp-cli-cache';
+            $env = wpfoundry_build_cli_env();
 
             $process = proc_open($command_to_run . " 2>&1", $descriptorspec, $pipes, ABSPATH, $env);
             if (!is_resource($process)) {
@@ -1489,18 +1536,7 @@ class WPFCommandRunner {
         $command_to_run = (strpos($command, 'wp ') === 0) ? $command : "wp $command";
         $safe_command = escapeshellcmd($command_to_run);
 
-        // Build env deliberately. $_ENV can be empty on hosts where
-        // variables_order omits "E"; fall back to getenv() for essentials.
-        $env = is_array($_ENV) ? $_ENV : [];
-        foreach (['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TMPDIR'] as $env_key) {
-            if (!isset($env[$env_key])) {
-                $env_value = getenv($env_key);
-                if ($env_value !== false && $env_value !== '') {
-                    $env[$env_key] = $env_value;
-                }
-            }
-        }
-        $env['WP_CLI_CACHE_DIR'] = sys_get_temp_dir() . '/wp-cli-cache';
+        $env = wpfoundry_build_cli_env();
 
         $process = proc_open($safe_command . " 2>&1", $descriptorspec, $pipes, ABSPATH, $env);
         if (!is_resource($process)) {
@@ -1878,7 +1914,10 @@ function wpf_verify_hmac_auth($request) {
 // Simple rate limiter to prevent abuse
 function wpf_check_rate_limit() {
     $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
-    $key = 'wpf_rate_limit_' . md5($ip);
+    // Use sha256 (truncated) for consistency with the rest of the plugin —
+    // md5 is deprecated for security contexts even though this is just a
+    // cache key.
+    $key = 'wpf_rate_limit_' . substr(hash('sha256', $ip), 0, 32);
     $now = time();
 
     // Get current rate limit data
@@ -2001,11 +2040,16 @@ function wpf_download_file($request) {
         return new WP_Error('file_not_found', 'Backup file not found', ['status' => 404]);
     }
 
-    // Stream the file then clean up.
+    // Stream the file then clean up. Explicit no-store + no-transform so
+    // intermediaries (corp proxies, CDNs) don't retain the one-shot backup
+    // archive.
     header('Content-Type: application/zip');
     header('Content-Disposition: attachment; filename="' . basename($filename) . '"');
     header('Content-Length: ' . filesize($path));
-    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+    header('Cache-Control: no-store, no-cache, must-revalidate, no-transform, private, max-age=0');
+    header('Pragma: no-cache');
+    header('Expires: 0');
+    header('X-Content-Type-Options: nosniff');
 
     $fh = fopen($path, 'rb');
     if ($fh === false) {
@@ -2052,9 +2096,41 @@ function wpf_upload_file($request) {
         return new WP_Error('invalid_file_type', 'Only zip files are supported', ['status' => 400]);
     }
 
+    // Enforce a sensible size cap so a malicious or buggy client cannot fill
+    // the server disk via the upload endpoint. 128 MB is well above the
+    // largest legitimate WordPress plugin/theme zips in practice.
+    $tmp_size = is_file($tmp_name) ? filesize($tmp_name) : 0;
+    $max_upload_bytes = apply_filters('wpfoundry_max_upload_bytes', 128 * 1024 * 1024);
+    if ($tmp_size === false || $tmp_size <= 0) {
+        return new WP_Error('invalid_upload', 'Uploaded file is empty', ['status' => 400]);
+    }
+    if ($tmp_size > $max_upload_bytes) {
+        return new WP_Error(
+            'upload_too_large',
+            sprintf('Upload exceeds maximum size of %d bytes', $max_upload_bytes),
+            ['status' => 413]
+        );
+    }
+
+    // Verify the file actually starts with a zip local-file-header magic
+    // ("PK\x03\x04") or the empty-archive marker ("PK\x05\x06"). The
+    // file-extension check alone lets any blob through.
+    $fh = @fopen($tmp_name, 'rb');
+    if (!$fh) {
+        return new WP_Error('invalid_upload', 'Failed to read uploaded file', ['status' => 400]);
+    }
+    $magic = fread($fh, 4);
+    fclose($fh);
+    if ($magic !== "PK\x03\x04" && $magic !== "PK\x05\x06" && $magic !== "PK\x07\x08") {
+        return new WP_Error('invalid_file_type', 'Uploaded file is not a valid zip archive', ['status' => 400]);
+    }
+
     $base_dir = trailingslashit(WP_CONTENT_DIR) . 'uploads/wpfoundry';
     if (!wp_mkdir_p($base_dir)) {
         return new WP_Error('upload_dir_failed', 'Failed to create upload directory', ['status' => 500]);
+    }
+    if (!wp_is_writable($base_dir)) {
+        return new WP_Error('upload_dir_not_writable', 'Upload directory is not writable', ['status' => 500]);
     }
 
     $safe_name = wp_unique_filename($base_dir, $original_name);
@@ -2143,6 +2219,14 @@ function wpf_install_from_upload($request) {
     if (!$result) {
         return new WP_Error('install_failed', 'Installation failed', ['status' => 500]);
     }
+
+    // Clean up the uploaded zip + transient on success. Previously this was
+    // only done when the client called /upload-delete, so a crashed client
+    // would leave zips accumulating in wp-content/uploads/wpfoundry.
+    if (!empty($path) && file_exists($path)) {
+        @unlink($path);
+    }
+    delete_transient('wpf_upload_' . $token);
 
     return rest_ensure_response([
         'success' => true,
