@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 4.0.4
+Version: 4.0.5
 Author: Mikey
 */
 
@@ -834,7 +834,7 @@ class WPFCommandRunner {
             return;
         }
 
-        $data = get_transient('wpf_upload_' . $token);
+        $data = wpf_upload_get_token($token);
         if (!is_array($data) || empty($data['path']) || !file_exists($data['path'])) {
             $this->emit_event('command_error', [
                 'error' => 'token_not_found',
@@ -886,6 +886,7 @@ class WPFCommandRunner {
             'line_number' => 1,
             'raw_line' => json_encode(['status' => 'success', 'type' => $type])
         ]);
+        wpf_upload_delete_token($token);
         $this->emit_event('command_complete', [
             'exit_code' => 0,
             'status' => 'success',
@@ -2296,6 +2297,91 @@ function wpf_download_file($request) {
 }
 
 /**
+ * Upload token storage helpers.
+ *
+ * Mirrors download-token fallbacks: object-cache / Redis hosts often drop
+ * transients between the upload request and the install request.
+ */
+function wpf_upload_base_dir() {
+    return trailingslashit(WP_CONTENT_DIR) . 'uploads/wpfoundry';
+}
+
+function wpf_upload_token_json_path($token) {
+    return trailingslashit(wpf_upload_base_dir()) . 'wpfoundry-upload-' . $token . '.json';
+}
+
+function wpf_upload_default_zip_path($token) {
+    return trailingslashit(wpf_upload_base_dir()) . 'wpfoundry-upload-' . $token . '.zip';
+}
+
+function wpf_upload_store_token($token, array $payload, $ttl = 600) {
+    set_transient('wpf_upload_' . $token, $payload, $ttl);
+    @file_put_contents(wpf_upload_token_json_path($token), json_encode($payload));
+}
+
+function wpf_upload_get_token($token) {
+    $data = get_transient('wpf_upload_' . $token);
+    if (!is_array($data) || empty($data['path'])) {
+        $token_file = wpf_upload_token_json_path($token);
+        if (file_exists($token_file)) {
+            $raw = @file_get_contents($token_file);
+            $decoded = $raw ? json_decode($raw, true) : null;
+            if (is_array($decoded) && !empty($decoded['path'])) {
+                $data = $decoded;
+            }
+        }
+    }
+
+    if ((!is_array($data) || empty($data['path'])) && file_exists(wpf_upload_default_zip_path($token))) {
+        $zip_guess = wpf_upload_default_zip_path($token);
+        $data = [
+            'path' => $zip_guess,
+            'filename' => basename($zip_guess),
+            'created_at' => filemtime($zip_guess) ?: time(),
+            'expires_at' => (filemtime($zip_guess) ?: time()) + 600,
+            'size' => filesize($zip_guess),
+        ];
+    }
+
+    if (!is_array($data) || empty($data['path'])) {
+        return null;
+    }
+
+    if (isset($data['expires_at']) && is_numeric($data['expires_at']) && time() > intval($data['expires_at'])) {
+        wpf_upload_delete_token($token);
+        return null;
+    }
+
+    return $data;
+}
+
+function wpf_upload_delete_token($token) {
+    $zip_guess = wpf_upload_default_zip_path($token);
+    $json_path = wpf_upload_token_json_path($token);
+
+    $data = get_transient('wpf_upload_' . $token);
+    if (!is_array($data) || empty($data['path'])) {
+        if (file_exists($json_path)) {
+            $raw = @file_get_contents($json_path);
+            $decoded = $raw ? json_decode($raw, true) : null;
+            if (is_array($decoded) && !empty($decoded['path'])) {
+                $data = $decoded;
+            }
+        }
+    }
+
+    delete_transient('wpf_upload_' . $token);
+    @unlink($json_path);
+
+    if (is_array($data) && !empty($data['path']) && file_exists($data['path'])) {
+        @unlink($data['path']);
+    }
+    if (file_exists($zip_guess)) {
+        @unlink($zip_guess);
+    }
+}
+
+/**
  * Upload a zip file for plugin/theme installation.
  */
 function wpf_upload_file($request) {
@@ -2349,7 +2435,7 @@ function wpf_upload_file($request) {
         return new WP_Error('invalid_file_type', 'Uploaded file is not a valid zip archive', ['status' => 400]);
     }
 
-    $base_dir = trailingslashit(WP_CONTENT_DIR) . 'uploads/wpfoundry';
+    $base_dir = wpf_upload_base_dir();
     if (!wp_mkdir_p($base_dir)) {
         return new WP_Error('upload_dir_failed', 'Failed to create upload directory', ['status' => 500]);
     }
@@ -2357,13 +2443,13 @@ function wpf_upload_file($request) {
         return new WP_Error('upload_dir_not_writable', 'Upload directory is not writable', ['status' => 500]);
     }
 
-    $safe_name = wp_unique_filename($base_dir, $original_name);
-    $dest_path = trailingslashit($base_dir) . $safe_name;
+    $token = bin2hex(random_bytes(16));
+    $dest_path = wpf_upload_default_zip_path($token);
     if (!move_uploaded_file($tmp_name, $dest_path)) {
         return new WP_Error('upload_move_failed', 'Failed to move uploaded file', ['status' => 500]);
     }
 
-    $token = bin2hex(random_bytes(16));
+    $safe_name = basename($dest_path);
     $size = filesize($dest_path);
     $payload = [
         'path' => $dest_path,
@@ -2372,7 +2458,7 @@ function wpf_upload_file($request) {
         'expires_at' => time() + 600,
         'size' => $size !== false ? $size : 0,
     ];
-    set_transient('wpf_upload_' . $token, $payload, 600);
+    wpf_upload_store_token($token, $payload, 600);
 
     return rest_ensure_response([
         'success' => true,
@@ -2411,7 +2497,7 @@ function wpf_install_from_upload($request) {
         return new WP_Error('invalid_type', 'Type must be plugin or theme', ['status' => 400]);
     }
 
-    $data = get_transient('wpf_upload_' . $token);
+    $data = wpf_upload_get_token($token);
     if (!is_array($data) || empty($data['path']) || !file_exists($data['path'])) {
         return new WP_Error('token_not_found', 'Upload token not found or expired', ['status' => 404]);
     }
@@ -2444,13 +2530,10 @@ function wpf_install_from_upload($request) {
         return new WP_Error('install_failed', 'Installation failed', ['status' => 500]);
     }
 
-    // Clean up the uploaded zip + transient on success. Previously this was
+    // Clean up the uploaded zip + token on success. Previously this was
     // only done when the client called /upload-delete, so a crashed client
     // would leave zips accumulating in wp-content/uploads/wpfoundry.
-    if (!empty($path) && file_exists($path)) {
-        @unlink($path);
-    }
-    delete_transient('wpf_upload_' . $token);
+    wpf_upload_delete_token($token);
 
     return rest_ensure_response([
         'success' => true,
@@ -2467,11 +2550,7 @@ function wpf_delete_uploaded_file($request) {
         return new WP_Error('invalid_token', 'Missing or invalid token', ['status' => 400]);
     }
 
-    $data = get_transient('wpf_upload_' . $token);
-    if (is_array($data) && !empty($data['path']) && file_exists($data['path'])) {
-        @unlink($data['path']);
-    }
-    delete_transient('wpf_upload_' . $token);
+    wpf_upload_delete_token($token);
 
     return rest_ensure_response([
         'success' => true,
