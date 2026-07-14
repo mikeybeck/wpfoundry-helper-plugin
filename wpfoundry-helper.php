@@ -2,7 +2,7 @@
 /*
 Plugin Name: WP Foundry Helper
 Description: Execute WP-CLI commands via REST with structured real-time streaming (SSE).
-Version: 4.0.3
+Version: 4.0.4
 Author: Mikey
 */
 
@@ -205,12 +205,8 @@ function wpfoundry_handle_custom_endpoint() {
         exit;
     }
 
-    if (is_user_logged_in() && !current_user_can('update_plugins')) {
-        status_header(403);
-        header('Content-Type: application/json');
-        echo json_encode(['error' => 'Forbidden']);
-        exit;
-    }
+    // HMAC shared-secret auth is the sole gate (same as REST routes). Possession of
+    // the secret is full authority; no WordPress capability check is applied.
 
     $decoded = json_decode($body, true);
     $command = is_array($decoded) ? ($decoded['command'] ?? '') : '';
@@ -304,7 +300,7 @@ class WPFCommandRunner {
             'start_time' => microtime(true)
         ]);
 
-        $version = '1.0.0'; // Built-in version
+        $version = $this->wpfoundry_get_this_plugin_version();
 
         $this->emit_event('command_data', [
             'data' => [['status' => 'success', 'version' => $version]],
@@ -358,7 +354,67 @@ class WPFCommandRunner {
         return $dir === '.' ? '' : $dir;
     }
 
+    private function wpfoundry_is_allowed_helper_zip_url($zip_url) {
+        $parts = wp_parse_url($zip_url);
+        if (!$parts || empty($parts['scheme']) || empty($parts['host'])) {
+            return false;
+        }
+        if (strtolower($parts['scheme']) !== 'https') {
+            return false;
+        }
+        $host = strtolower($parts['host']);
+        return in_array($host, ['github.com', 'codeload.github.com'], true);
+    }
+
+    private function wpfoundry_zip_entry_is_safe($entry_name, $extract_real) {
+        if ($entry_name === '' || strpos($entry_name, "\0") !== false) {
+            return false;
+        }
+        $name = str_replace('\\', '/', $entry_name);
+        if ($name[0] === '/' || preg_match('#^[a-zA-Z]:/#', $name)) {
+            return false;
+        }
+        $segments = explode('/', $name);
+        foreach ($segments as $segment) {
+            if ($segment === '..') {
+                return false;
+            }
+        }
+        $target = $extract_real . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $name);
+        $extract_prefix = rtrim($extract_real, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+        // Resolve .. and . without requiring the path to exist yet.
+        $normalized = $this->wpfoundry_normalize_filesystem_path($target);
+        if ($normalized === $extract_real) {
+            return true;
+        }
+        return strpos($normalized . DIRECTORY_SEPARATOR, $extract_prefix) === 0;
+    }
+
+    private function wpfoundry_normalize_filesystem_path($path) {
+        $path = str_replace('\\', '/', $path);
+        $parts = [];
+        $absolute = isset($path[0]) && $path[0] === '/';
+        foreach (explode('/', $path) as $part) {
+            if ($part === '' || $part === '.') {
+                continue;
+            }
+            if ($part === '..') {
+                if (!empty($parts)) {
+                    array_pop($parts);
+                }
+                continue;
+            }
+            $parts[] = $part;
+        }
+        $normalized = implode(DIRECTORY_SEPARATOR, $parts);
+        return $absolute ? (DIRECTORY_SEPARATOR . $normalized) : $normalized;
+    }
+
     private function wpfoundry_download_and_extract_zip($zip_url) {
+        if (!$this->wpfoundry_is_allowed_helper_zip_url($zip_url)) {
+            throw new Exception('Zip URL must be HTTPS from github.com or codeload.github.com');
+        }
+
         if (!function_exists('download_url')) {
             require_once ABSPATH . 'wp-admin/includes/file.php';
         }
@@ -378,11 +434,32 @@ class WPFCommandRunner {
             throw new Exception('Failed to create temp dir for extraction');
         }
 
+        $extract_real = realpath($extract_base);
+        if ($extract_real === false) {
+            @unlink($tmp);
+            $this->wpfoundry_cleanup_dir_best_effort($extract_base);
+            throw new Exception('Failed to resolve extract directory');
+        }
+
         $zip = new ZipArchive();
         $opened = $zip->open($tmp);
         if ($opened !== true) {
             @unlink($tmp);
+            $this->wpfoundry_cleanup_dir_best_effort($extract_base);
             throw new Exception('Unzip failed: unable to open zip (code ' . $opened . ')');
+        }
+
+        for ($i = 0; $i < $zip->numFiles; $i++) {
+            $entry_name = $zip->getNameIndex($i);
+            if ($entry_name === false) {
+                continue;
+            }
+            if (!$this->wpfoundry_zip_entry_is_safe($entry_name, $extract_real)) {
+                $zip->close();
+                @unlink($tmp);
+                $this->wpfoundry_cleanup_dir_best_effort($extract_base);
+                throw new Exception('Zip path traversal detected: ' . $entry_name);
+            }
         }
 
         $ok = $zip->extractTo($extract_base);
@@ -390,10 +467,43 @@ class WPFCommandRunner {
         @unlink($tmp);
 
         if (!$ok) {
+            $this->wpfoundry_cleanup_dir_best_effort($extract_base);
             throw new Exception('Unzip failed: extractTo() returned false');
         }
 
         return $extract_base;
+    }
+
+    /**
+     * Replace the plugin directory without deleting first: stage new copy, rename
+     * existing aside, move staged into place, then remove the backup.
+     */
+    private function wpfoundry_replace_plugin_dir($source_dir, $dest_dir) {
+        $dest_dir = rtrim($dest_dir, '/\\');
+        $staging = $dest_dir . '.wpf-new-' . uniqid('', true);
+        $backup = $dest_dir . '.wpf-old-' . uniqid('', true);
+
+        try {
+            $this->wpfoundry_copy_dir_recursive($source_dir, $staging);
+
+            if (file_exists($dest_dir)) {
+                if (!@rename($dest_dir, $backup)) {
+                    throw new Exception('Failed to move existing plugin directory aside');
+                }
+            }
+
+            if (!@rename($staging, $dest_dir)) {
+                if (file_exists($backup) && !file_exists($dest_dir)) {
+                    @rename($backup, $dest_dir);
+                }
+                throw new Exception('Failed to move new plugin directory into place');
+            }
+
+            $this->wpfoundry_cleanup_dir_best_effort($backup);
+        } catch (Exception $e) {
+            $this->wpfoundry_cleanup_dir_best_effort($staging);
+            throw $e;
+        }
     }
 
     private function wpfoundry_find_file_recursive($base_dir, $target_filename, $max_depth = 6, $depth = 0) {
@@ -529,10 +639,10 @@ class WPFCommandRunner {
         ]);
 
         $zip_url = isset($args[0]) ? trim((string) $args[0]) : '';
-        if (!$zip_url || !filter_var($zip_url, FILTER_VALIDATE_URL)) {
+        if (!$zip_url || !filter_var($zip_url, FILTER_VALIDATE_URL) || !$this->wpfoundry_is_allowed_helper_zip_url($zip_url)) {
             $this->emit_event('command_error', [
                 'error' => 'missing_zip_url',
-                'message' => 'Missing or invalid zip URL argument',
+                'message' => 'Missing or invalid zip URL argument (HTTPS github.com / codeload.github.com only)',
                 'exit_code' => 1,
                 'status' => 'error'
             ]);
@@ -590,10 +700,10 @@ class WPFCommandRunner {
         ]);
 
         $zip_url = isset($args[0]) ? trim((string) $args[0]) : '';
-        if (!$zip_url || !filter_var($zip_url, FILTER_VALIDATE_URL)) {
+        if (!$zip_url || !filter_var($zip_url, FILTER_VALIDATE_URL) || !$this->wpfoundry_is_allowed_helper_zip_url($zip_url)) {
             $this->emit_event('command_error', [
                 'error' => 'missing_zip_url',
-                'message' => 'Missing or invalid zip URL argument',
+                'message' => 'Missing or invalid zip URL argument (HTTPS github.com / codeload.github.com only)',
                 'exit_code' => 1,
                 'status' => 'error'
             ]);
@@ -623,9 +733,8 @@ class WPFCommandRunner {
             $source_dir = dirname($main_file);
             $dest_dir = trailingslashit(WP_PLUGIN_DIR) . $slug_dir;
 
-            // Replace plugin directory (no WP_Filesystem; avoids FTP credential prompts)
-            $this->wpfoundry_delete_dir_recursive($dest_dir);
-            $this->wpfoundry_copy_dir_recursive($source_dir, $dest_dir);
+            // Stage + rename replace (avoids bricking if copy fails mid-way)
+            $this->wpfoundry_replace_plugin_dir($source_dir, $dest_dir);
 
             $this->wpfoundry_cleanup_dir_best_effort($extract_base);
 
@@ -846,11 +955,35 @@ class WPFCommandRunner {
             $scan_path = isset($base_paths[$options['type']]) ? $base_paths[$options['type']] : ABSPATH;
         }
 
-        if (!is_dir($scan_path)) {
-            throw new Exception("Directory does not exist: $scan_path");
-        }
+        $scan_path = $this->wpfoundry_confine_path_under_abspath($scan_path);
 
         return $this->scan_directory($scan_path, $scan_path, $options, 0);
+    }
+
+    /**
+     * Resolve $path and ensure it stays under the WordPress ABSPATH tree.
+     */
+    private function wpfoundry_confine_path_under_abspath($path) {
+        $abs = realpath(ABSPATH);
+        if ($abs === false) {
+            throw new Exception('Could not resolve WordPress root');
+        }
+
+        $resolved = realpath($path);
+        if ($resolved === false) {
+            throw new Exception("Directory does not exist: $path");
+        }
+
+        if ($resolved === $abs) {
+            return $resolved;
+        }
+
+        $abs_prefix = rtrim($abs, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+        if (strpos($resolved . DIRECTORY_SEPARATOR, $abs_prefix) !== 0) {
+            throw new Exception('Path is outside the WordPress installation');
+        }
+
+        return $resolved;
     }
 
     private function scan_directory($dir, $base_path, $options, $current_depth) {
@@ -892,7 +1025,6 @@ class WPFCommandRunner {
             } else {
                 $files[] = [
                     'path' => ltrim($relative_path, '/'),
-                    'full_path' => $full_path,
                     'size' => filesize($full_path),
                     'modified' => filemtime($full_path),
                     'type' => $this->get_file_type($full_path),
@@ -1531,10 +1663,16 @@ class WPFCommandRunner {
             1 => ['pipe', 'w'], // stdout (also receives stderr via 2>&1)
         ];
 
-        // SECURITY: Sanitize command for shell execution
-        // Don't add 'wp' prefix if command already starts with 'wp'
-        $command_to_run = (strpos($command, 'wp ') === 0) ? $command : "wp $command";
-        $safe_command = escapeshellcmd($command_to_run);
+        // SECURITY: Per-argument shell escaping (stronger than escapeshellcmd on the whole string)
+        $safe_command = wpf_build_safe_shell_command($command);
+        if ($safe_command === false) {
+            $this->emit_event('command_error', [
+                'error' => 'invalid_command',
+                'message' => 'Failed to tokenize command for safe execution',
+                'command' => $command
+            ]);
+            return;
+        }
 
         $env = wpfoundry_build_cli_env();
 
@@ -1648,6 +1786,11 @@ class WPFCommandRunner {
  * Validate and sanitize WP-CLI command input
  */
 function wpf_validate_command($command) {
+    // SECURITY: Reject newlines / carriage returns (command injection via multiline)
+    if (preg_match('/[\r\n]/', $command)) {
+        return false;
+    }
+
     // SECURITY: Check for command injection attempts
     if (preg_match('/[;&|`$()<>]/', $command)) {
         return false;
@@ -1693,6 +1836,87 @@ function wpf_validate_command($command) {
     }
 
     return false;
+}
+
+/**
+ * Tokenize a command line respecting single/double quotes (quotes are consumed).
+ *
+ * @return string[]|false Tokens, or false on unbalanced quotes / empty input.
+ */
+function wpf_tokenize_command($command) {
+    $tokens = [];
+    $current = '';
+    $in_single = false;
+    $in_double = false;
+    $length = strlen($command);
+
+    for ($i = 0; $i < $length; $i++) {
+        $ch = $command[$i];
+
+        if ($in_single) {
+            if ($ch === "'") {
+                $in_single = false;
+            } else {
+                $current .= $ch;
+            }
+            continue;
+        }
+
+        if ($in_double) {
+            if ($ch === '"') {
+                $in_double = false;
+            } else {
+                $current .= $ch;
+            }
+            continue;
+        }
+
+        if ($ch === "'") {
+            $in_single = true;
+            continue;
+        }
+        if ($ch === '"') {
+            $in_double = true;
+            continue;
+        }
+        if ($ch === ' ' || $ch === "\t") {
+            if ($current !== '') {
+                $tokens[] = $current;
+                $current = '';
+            }
+            continue;
+        }
+
+        $current .= $ch;
+    }
+
+    if ($in_single || $in_double) {
+        return false;
+    }
+    if ($current !== '') {
+        $tokens[] = $current;
+    }
+    if (empty($tokens)) {
+        return false;
+    }
+
+    return $tokens;
+}
+
+/**
+ * Build a shell-safe command string by escaping each token with escapeshellarg.
+ *
+ * @return string|false Escaped command, or false if tokenization fails.
+ */
+function wpf_build_safe_shell_command($command) {
+    $command_to_run = (strpos($command, 'wp ') === 0) ? $command : "wp $command";
+    $tokens = wpf_tokenize_command($command_to_run);
+    if ($tokens === false) {
+        return false;
+    }
+
+    $escaped = array_map('escapeshellarg', $tokens);
+    return implode(' ', $escaped);
 }
 
 function wpfoundry_get_shared_secret($force_regenerate = false) {
@@ -2306,8 +2530,6 @@ function wpf_run_command_sse_with_command($command) {
     header('Cache-Control: no-cache');
     header('Connection: keep-alive');
     header('X-Accel-Buffering: no');
-    header('Access-Control-Allow-Origin: *');
-    header('Access-Control-Allow-Headers: Content-Type, X-WPF-TS, X-WPF-Nonce, X-WPF-Signature, X-WPF-Request-Id, X-WPF-Body-SHA256');
     @ini_set('output_buffering', 'off');
     @ini_set('zlib.output_compression', '0');
     @ini_set('max_execution_time', '0');
