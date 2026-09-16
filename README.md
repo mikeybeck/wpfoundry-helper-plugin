@@ -7,3 +7,5 @@ This repository is the **full** helper used by the WP Foundry desktop app (Wails
 - Requires WP-CLI on the server and WP Foundry app 2.x.
 
 Current version: **4.2.0**.
+
+Sites still on 4.0.5 look for  and its  header when checking GitHub. That file remains the plugin entry for those upgrades and loads .
